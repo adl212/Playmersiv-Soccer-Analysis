@@ -38,8 +38,7 @@ while cap.isOpened() and frames_looped < 23000:
     results = model.predict(
         frame,
         imgsz=640,
-        verbose=False,
-        device=[0,1]
+        verbose=False
     )
 
     ball_detection = None
