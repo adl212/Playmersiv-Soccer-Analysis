@@ -1,128 +1,170 @@
 
-from ultralytics import YOLO
 import cv2
 import numpy as np
+from ultralytics import YOLO
+from detect import BallDetector
+
+from CameraMotion import CameraMotionEstimator
 from BallTracker import BallTracker
+from CameraMotionVisualizer import CameraMotionVisualizer
 
-model = YOLO('soccer_yolov8n_best.pt')
+# --------------------------------------------------
+# INITIALIZATION
+# --------------------------------------------------
 
-# Change these to match your model's class IDs.
-BALL_CLASS = 1
-PLAYER_CLASS = 0
+VIDEO_PATH = "18eBfrhGS3BurZIDah6IcXVfDnbUaE5Jk.mp4"
 
+cap = cv2.VideoCapture(VIDEO_PATH)
+
+camera = CameraMotionEstimator()
+
+# Do not pass camera here because main loop handles it.
 tracker = BallTracker()
 
-cap = cv2.VideoCapture("/kaggle/input/datasets/adl212/playmersiv-ai-camera-footage/18eBfrhGS3BurZIDah6IcXVfDnbUaE5Jk.mp4")
+visualizer = CameraMotionVisualizer()
 
-# 1. Define video properties
-output_filename = 'output.mp4'
-fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Codec for .mp4 files
-fps = cap.get(5)                               # Frames per second
-frame_size = (int(cap.get(3)), int(cap.get(4)))                  # Width, Height (MUST match your frame dimensions)
-print(frame_size)
-# 2. Initialize the VideoWriter object
-out = cv2.VideoWriter(output_filename, fourcc, fps, frame_size)
+detector = BallDetector(
+    model_path="soccer_yolov8n_best.pt",
+    confidence=0.25
+)
+# --------------------------------------------------
+# MAIN LOOP
+# --------------------------------------------------
+cap.set(cv2.CAP_PROP_POS_FRAMES, 85000)
+while True:
 
-trajectory = []
-frames_looped = 20000
-cap.set(cv2.CAP_PROP_POS_FRAMES, frames_looped)
-while cap.isOpened() and frames_looped < 23000:
-    frames_looped += 1
-    if frames_looped % 100 == 0:
-        print(frames_looped)
     ret, frame = cap.read()
 
     if not ret:
         break
 
-    results = model.predict(
-        frame,
-        imgsz=640,
-        verbose=False
-    )
+    # ----------------------------------------------
+    # 1. YOLO BALL DETECTION
+    # ----------------------------------------------
 
-    ball_detection = None
+    # Replace this with your existing YOLO detection.
+    #
+    # Expected format:
+    # detection = (center_x, center_y)
+    # or None if no ball is detected.
 
-    for box in results[0].boxes:
+    detection = detector.get_ball_detection(frame)
 
-        class_id = int(box.cls[0])
-        confidence = float(box.conf[0])
+    # ----------------------------------------------
+    # 2. ESTIMATE CAMERA MOTION
+    # ----------------------------------------------
 
-        x1, y1, x2, y2 = (
-            box.xyxy[0].cpu().numpy().astype(int)
-        )
+    camera_result = camera.update(frame)
 
-        center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
+    camera_success = camera_result["success"]
 
-        if class_id == BALL_CLASS:
+    H = camera_result["homography"]
 
-            if ball_detection is None:
-                ball_detection = (
-                    center_x,
-                    center_y
+    # ----------------------------------------------
+    # 3. GET PREVIOUS KALMAN STATE
+    # ----------------------------------------------
+
+    raw_prediction = None
+    compensated_prediction = None
+
+    if tracker.initialized:
+
+        previous_state = tracker.kf.statePost.copy()
+
+        F = tracker.kf.transitionMatrix
+
+        # ------------------------------------------
+        # 4. UNCOMPENSATED PREDICTION
+        # ------------------------------------------
+
+        raw_state = F @ previous_state
+
+        raw_prediction = raw_state[:2].flatten()
+
+        # ------------------------------------------
+        # 5. CAMERA-COMPENSATED PREDICTION
+        # ------------------------------------------
+
+        if camera_success:
+
+            # Temporarily transform a copy of the
+            # previous state.
+
+            original_state = tracker.kf.statePost.copy()
+            original_covariance = tracker.kf.errorCovPost.copy()
+
+            transformed = tracker._transform_state(H)
+
+            if transformed:
+
+                compensated_state = (
+                    tracker.kf.transitionMatrix @
+                    tracker.kf.statePost
                 )
 
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2
-            )
+                compensated_prediction = (
+                    compensated_state[:2].flatten()
+                )
 
-        elif class_id == PLAYER_CLASS:
+            # Restore original state. The tracker will
+            # perform its actual update independently.
+            tracker.kf.statePost = original_state
+            tracker.kf.errorCovPost = original_covariance
 
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                (255, 0, 0),
-                2
-            )
+    # ----------------------------------------------
+    # 6. UPDATE BALL TRACKER
+    # ----------------------------------------------
 
-    # Update ball tracker.
-    ball = tracker.update(ball_detection)
+    ball_position = tracker.update(detection)
 
-    if ball is not None:
+    # ----------------------------------------------
+    # 7. VISUALIZATION
+    # ----------------------------------------------
 
-        x, y = map(int, ball)
+    output = visualizer.visualize(
+        frame=frame,
+        camera_result=camera_result,
+        detection=detection,
+        raw_prediction=raw_prediction,
+        compensated_prediction=compensated_prediction
+    )
 
-        trajectory.append((x, y))
+    # Draw final tracked ball position.
+    if ball_position is not None:
 
-        # Draw trajectory.
-        for i in range(1, len(trajectory)):
+        x, y = map(int, ball_position)
 
-            cv2.line(
-                frame,
-                trajectory[i - 1],
-                trajectory[i],
-                (0, 255, 255),
-                2
-            )
-
-        # Draw filtered position.
         cv2.circle(
-            frame,
+            output,
             (x, y),
-            8,
-            (0, 0, 255),
+            5,
+            (0, 255, 0),
             -1
         )
 
-        velocity = tracker.velocity()
-
         cv2.putText(
-            frame,
-            f"Velocity: {np.linalg.norm(velocity):.1f}",
-            (20, 40),
+            output,
+            "Final tracked position",
+            (x + 10, y + 20),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
+            0.5,
+            (0, 255, 0),
             2
         )
-    else:
-        trajectory = []
-    out.write(frame)
 
-out.release()
+    # ----------------------------------------------
+    # 8. DISPLAY
+    # ----------------------------------------------
+
+    cv2.imshow("Camera Motion + Ball Tracking", output)
+
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+
+# --------------------------------------------------
+# CLEANUP
+# --------------------------------------------------
+
+cap.release()
+cv2.destroyAllWindows()
