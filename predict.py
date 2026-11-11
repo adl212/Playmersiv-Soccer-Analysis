@@ -2,7 +2,9 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
+from BallTracker import BallTracker
 
+model = YOLO('soccer_yolov8n_best.pt')
 
 # Change these to match your model's class IDs.
 BALL_CLASS = 1
