@@ -124,113 +124,87 @@ class BallTracker:
 
         return True
 
-    def update(self, detection, frame=None, mask=None):
+    
+    def update(self, detection, camera_H=None):
         """
-        Args:
-            detection: (x, y) ball center, or None.
-            frame: Current video frame (BGR).
-            mask: Optional camera feature-detection mask.
+        Update ball tracking.
 
-        Returns:
-            Estimated ball position (x, y), or None.
+        detection: (x, y) or None
+        camera_H: homography mapping previous-frame coordinates
+                to current-frame coordinates.
         """
 
-        camera_success = False
-
-        # 1. Estimate camera movement
-        if self.camera is not None and frame is not None:
-
-            self.last_camera_result = self.camera.update(
-                frame,
-                mask=mask
-            )
-
-            camera_success = (
-                self.last_camera_result["success"]
-            )
-
-        # 2. Initialize tracker
         if not self.initialized:
-
             if detection is None:
                 return None
 
             x, y = detection
 
-            self.kf.statePost = np.array([
-                [x], [y], [0], [0]
-            ], dtype=np.float32)
+            self.kf.statePost = np.array(
+                [[x], [y], [0], [0]],
+                dtype=np.float32
+            )
 
             self.initialized = True
             self.missed_frames = 0
 
-            return (float(x), float(y))
+            return (x, y)
 
-        # 3. Compensate for camera movement
-        if camera_success:
+        # --------------------------------------------------------
+        # 1. Compensate tracker state for camera motion
+        # --------------------------------------------------------
 
-            H = self.last_camera_result["homography"]
+        if camera_H is not None:
+            self._transform_state(camera_H)
 
-            transformed = self._transform_state(H)
+        # --------------------------------------------------------
+        # 2. Kalman prediction
+        # --------------------------------------------------------
 
-            if not transformed:
-                camera_success = False
-
-        # If camera estimation fails, increase uncertainty.
-        # This prevents overconfidence in the uncorrected prediction.
-        if not camera_success:
-            self.kf.errorCovPost *= 1.25
-
-        # 4. Predict ball position
         prediction = self.kf.predict()
 
-        predicted_position = prediction[:2].flatten()
+        # --------------------------------------------------------
+        # 3. Correct using YOLO detection
+        # --------------------------------------------------------
 
-        # 5. Correct using ball detection
         if detection is not None:
 
-            measurement = np.array([
-                [detection[0]],
-                [detection[1]]
-            ], dtype=np.float32)
-
-            distance = np.linalg.norm(
-                measurement.flatten() - predicted_position
+            measurement = np.array(
+                [[detection[0]], [detection[1]]],
+                dtype=np.float32
             )
 
-            if distance < self.max_distance:
+            distance = np.linalg.norm(
+                measurement.flatten() - prediction[:2].flatten()
+            )
 
+            if distance < 150:
                 self.kf.correct(measurement)
                 self.missed_frames = 0
-
             else:
-                self.missed_frames += 1
-
-                # Keep prediction as the current state
+                # Reject implausible detection.
                 self.kf.statePost = self.kf.statePre.copy()
                 self.kf.errorCovPost = self.kf.errorCovPre.copy()
+                self.missed_frames += 1
 
         else:
-            self.missed_frames += 1
-
-            # Important: advance state even without a detection
+            # No detection: retain Kalman prediction.
             self.kf.statePost = self.kf.statePre.copy()
             self.kf.errorCovPost = self.kf.errorCovPre.copy()
+            self.missed_frames += 1
 
-        # 6. Handle prolonged detection loss
-        if self.missed_frames > self.max_missed_frames:
+        # --------------------------------------------------------
+        # 4. Handle lost tracking
+        # --------------------------------------------------------
 
-            self.initialized = False
-            self.missed_frames = 0
-
+        if self.missed_frames > 15:
+            self.reset()
             return None
 
         state = self.kf.statePost.flatten()
 
-        return (
-            float(state[0]),
-            float(state[1])
-        )
+        return (float(state[0]), float(state[1]))
+
 
     def velocity(self):
 
