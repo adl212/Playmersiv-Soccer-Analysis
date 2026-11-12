@@ -16,7 +16,7 @@ from pitch_visualizer import PitchVisualizer
 # ============================================================
 
 VIDEO_PATH = "18eBfrhGS3BurZIDah6IcXVfDnbUaE5Jk.mp4"
-MODEL_PATH = "soccer_yolov8n_best.pt"
+MODEL_PATH = "soccer_yolov8n_best (1).pt"
 
 PITCH_WIDTH = 1050
 PITCH_HEIGHT = 680
