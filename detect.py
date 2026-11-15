@@ -28,42 +28,87 @@ class BallDetector:
                 f"Available classes: {self.model.names}"
             )
 
-    def get_ball_detection(self, frame):
+    
+    def get_detections(self, frame, player_class_id):
+        """
+        Run YOLO once and extract:
+        - Highest-confidence ball center
+        - Bottom-center of every detected player bounding box
+
+        Returns:
+        ball_detection: (x, y) or None
+        player_positions: [(x, y), ...]
+        """
 
         results = self.model.predict(
-            frame,
+            source=frame,
             conf=self.confidence,
-            classes=[self.ball_class_id],
-            device=self.device,
             verbose=False
         )
 
-        best_detection = None
-        best_confidence = 0
+        result = results[0]
 
-        for result in results:
+        ball_detection = None
+        best_ball_confidence = 0
 
-            if result.boxes is None:
-                continue
+        player_positions = []
 
-            for box in result.boxes:
+        # Find ball class ID from model names
+        names = self.model.names
 
-                confidence = float(box.conf[0])
+        if isinstance(names, dict):
+            ball_class_id = next(
+                (class_id for class_id, name in names.items()
+                if name.lower() == "ball"),
+                None
+            )
+        else:
+            ball_class_id = next(
+                (class_id for class_id, name in enumerate(names)
+                if name.lower() == "ball"),
+                None
+            )
 
-                if confidence > best_confidence:
+        if ball_class_id is None:
+            raise ValueError("Could not find a 'ball' class in model.names")
 
-                    x1, y1, x2, y2 = (
-                        box.xyxy[0].cpu().numpy()
-                    )
+        for box in result.boxes:
+
+            class_id = int(box.cls[0].item())
+            confidence = float(box.conf[0].item())
+
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+
+            # -----------------------------------------
+            # BALL DETECTION
+            # -----------------------------------------
+
+            if class_id == ball_class_id:
+
+                if confidence > best_ball_confidence:
 
                     center_x = (x1 + x2) / 2
                     center_y = (y1 + y2) / 2
 
-                    best_detection = (
+                    ball_detection = (
                         float(center_x),
                         float(center_y)
                     )
 
-                    best_confidence = confidence
+                    best_ball_confidence = confidence
 
-        return best_detection
+            # -----------------------------------------
+            # PLAYER DETECTION
+            # -----------------------------------------
+
+            elif class_id == player_class_id:
+
+                bottom_center_x = (x1 + x2) / 2
+                bottom_center_y = y2
+
+                player_positions.append((
+                    float(bottom_center_x),
+                    float(bottom_center_y)
+                ))
+
+        return ball_detection, player_positions
