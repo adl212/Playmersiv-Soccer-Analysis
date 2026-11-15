@@ -9,7 +9,7 @@ from detect import BallDetector
 from field_mapper import FieldMapper
 from manual_calibration import ManualCalibration
 from pitch_visualizer import PitchVisualizer
-
+from player_tracker import PlayerTracker
 
 # ============================================================
 # CONFIGURATION
@@ -29,6 +29,8 @@ BALL_CONFIDENCE = 0.25
 SHOW_CAMERA_MOTION = True
 SHOW_PITCH = True
 
+PLAYER_MAX_DISTANCE = 100
+PLAYER_MAX_MISSED = 15
 # Maximum distance between a predicted ball position
 # and YOLO detection before rejecting that detection.
 # This is configured in ball_tracker.py.
@@ -53,6 +55,11 @@ camera = CameraMotionEstimator()
 # Ball tracker
 tracker = BallTracker()
 
+# Player tracker
+player_tracker = PlayerTracker(
+    max_distance=PLAYER_MAX_DISTANCE,
+    max_missed=PLAYER_MAX_MISSED
+)
 
 # YOLO detector
 detector = BallDetector(
@@ -339,7 +346,7 @@ while True:
     # 1. YOLO DETECTION
     # ========================================================
 
-    # Run the model once to detect both the ball and players.
+    # Run YOLO once to detect both the ball and players.
     detection, player_positions = detector.get_detections(
         frame,
         player_class_id=PLAYER_CLASS_ID
@@ -373,8 +380,7 @@ while True:
         H_camera
     )
 
-    # Transform raw prediction into current-frame coordinates
-    # so both predictions can be displayed on the current frame.
+    # Transform raw prediction into current-frame coordinates.
     if raw_prediction is not None and H_camera is not None:
 
         raw_prediction = transform_point(
@@ -387,8 +393,6 @@ while True:
     # 4. UPDATE BALL TRACKER
     # ========================================================
 
-    # The tracker transforms its internal state using H_camera
-    # before predicting and correcting with the current detection.
     ball_position = tracker.update(
         detection,
         camera_H=H_camera
@@ -399,14 +403,6 @@ while True:
     # 5. UPDATE FIELD HOMOGRAPHY
     # ========================================================
 
-    # Update the current image -> field transformation.
-    #
-    # H_camera maps previous frame -> current frame.
-    # Therefore:
-    #
-    # H_field_current =
-    #     H_field_previous @ inverse(H_camera)
-
     if camera_success:
 
         field_mapper.update_camera_motion(
@@ -415,17 +411,65 @@ while True:
 
 
     # ========================================================
-    # 6. MAP PLAYER POSITIONS TO FIELD COORDINATES
+    # 6. UPDATE PLAYER TRACKER
     # ========================================================
 
-    player_field_positions = map_players_to_field(
+    # >>> NEW
+    # Each player has an independent Kalman filter.
+    #
+    # Existing tracks are:
+    # 1. Compensated for camera movement.
+    # 2. Predicted into the current frame.
+    # 3. Matched against current YOLO detections.
+    # 4. Corrected when a matching detection is found.
+    #
+    # Players without detections retain their predicted positions.
+
+    player_tracks = player_tracker.update(
         player_positions,
-        field_mapper
+        camera_H=H_camera
     )
 
 
     # ========================================================
-    # 7. MAP BALL POSITION TO FIELD COORDINATES
+    # 7. MAP PLAYER POSITIONS TO FIELD COORDINATES
+    # ========================================================
+
+    # >>> UPDATED
+    # Map Kalman-filtered positions instead of raw YOLO positions.
+
+    player_field_positions = []
+
+    for track in player_tracks:
+
+        x, y = track["position"]
+
+        field_position = field_mapper.image_to_field(
+            (x, y)
+        )
+
+        if field_position is None:
+            continue
+
+        field_x, field_y = field_position
+
+        if (
+            np.isfinite(field_x) and
+            np.isfinite(field_y) and
+            0 <= field_x <= 1 and
+            0 <= field_y <= 1
+        ):
+
+            player_field_positions.append({
+                "id": track["id"],
+                "position": (field_x, field_y),
+                "detected": track["detected"],
+                "missed": track["missed"]
+            })
+
+
+    # ========================================================
+    # 8. MAP BALL POSITION TO FIELD COORDINATES
     # ========================================================
 
     field_position = None
@@ -446,11 +490,12 @@ while True:
                 0 <= field_x <= 1 and
                 0 <= field_y <= 1
             ):
+
                 field_position = None
 
 
     # ========================================================
-    # 8. CAMERA MOTION VISUALIZATION
+    # 9. CAMERA MOTION VISUALIZATION
     # ========================================================
 
     camera_view = frame.copy()
@@ -467,26 +512,49 @@ while True:
 
 
     # ========================================================
-    # 9. DRAW PLAYER DETECTIONS ON VIDEO
+    # 10. DRAW PLAYER DETECTIONS ON VIDEO
     # ========================================================
 
-    # Draw the YOLO player bottom-center points.
-    for player_x, player_y in player_positions:
+    # >>> UPDATED
+    # Draw player bounding-box bottom-center points.
 
-        x = int(player_x)
-        y = int(player_y)
+    for player_x, player_y in player_positions:
 
         cv2.circle(
             camera_view,
-            (x, y),
+            (int(player_x), int(player_y)),
             4,
             (255, 100, 0),
             -1
         )
 
 
+    # >>> NEW
+    # Draw persistent player IDs on the video.
+
+    for track in player_tracks:
+
+        x, y = track["position"]
+
+        color = (
+            (0, 255, 0)
+            if track["detected"]
+            else (0, 255, 255)
+        )
+
+        cv2.putText(
+            camera_view,
+            f"Player {track['id']}",
+            (int(x) + 8, int(y) - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1
+        )
+
+
     # ========================================================
-    # 10. DRAW TRACKED BALL ON VIDEO
+    # 11. DRAW TRACKED BALL ON VIDEO
     # ========================================================
 
     if ball_position is not None:
@@ -516,31 +584,108 @@ while True:
 
 
     # ========================================================
-    # 11. CREATE TOP-DOWN PITCH
+    # 12. CREATE TOP-DOWN PITCH
     # ========================================================
 
     if SHOW_PITCH:
 
-        # Create pitch and plot ball.
         pitch_view = pitch_visualizer.show(
             field_position
         )
 
-        # Plot all detected players.
-        pitch_view = draw_players_on_pitch(
-            pitch_view,
-            player_field_positions
-        )
+        # >>> UPDATED
+        # Draw all Kalman-filtered player positions.
+        # Orange = currently detected.
+        # Yellow = predicted because detection was missed.
 
-        # Display player count.
+        for player in player_field_positions:
+
+            player_id = player["id"]
+
+            field_x, field_y = player["position"]
+
+            detected = player["detected"]
+
+            pixel_x = int(
+                field_x * (PITCH_WIDTH - 1)
+            )
+
+            pixel_y = int(
+                field_y * (PITCH_HEIGHT - 1)
+            )
+
+            if detected:
+                color = (255, 140, 0)
+            else:
+                color = (0, 255, 255)
+
+            cv2.circle(
+                pitch_view,
+                (pixel_x, pixel_y),
+                8,
+                color,
+                -1
+            )
+
+            cv2.putText(
+                pitch_view,
+                str(player_id),
+                (pixel_x + 10, pixel_y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 255, 255),
+                1
+            )
+
+
+        # Player count
         cv2.putText(
             pitch_view,
-            f"Players: {len(player_field_positions)}",
+            f"Players: {len(player_tracks)}",
             (15, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (255, 255, 255),
             2
+        )
+
+        # >>> NEW
+        # Tracking legend
+
+        cv2.circle(
+            pitch_view,
+            (20, 55),
+            5,
+            (255, 140, 0),
+            -1
+        )
+
+        cv2.putText(
+            pitch_view,
+            "Detected",
+            (35, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
+        )
+
+        cv2.circle(
+            pitch_view,
+            (115, 55),
+            5,
+            (0, 255, 255),
+            -1
+        )
+
+        cv2.putText(
+            pitch_view,
+            "Predicted",
+            (130, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1
         )
 
         cv2.imshow(
@@ -550,17 +695,17 @@ while True:
 
 
     # ========================================================
-    # 12. DISPLAY VIDEO
+    # 13. DISPLAY VIDEO
     # ========================================================
 
     cv2.imshow(
-        "Camera Motion + Ball + Player Detection",
+        "Camera Motion + Ball + Player Tracking",
         camera_view
     )
 
 
     # ========================================================
-    # 13. DEBUG INFORMATION
+    # 14. DEBUG INFORMATION
     # ========================================================
 
     if camera_success:
@@ -569,7 +714,7 @@ while True:
 
         print(
             f"Frame {frame_number} | "
-            f"Players: {len(player_field_positions)} | "
+            f"Players: {len(player_tracks)} | "
             f"Pan X: {motion['translation_x']:.1f} | "
             f"Pan Y: {motion['translation_y']:.1f} | "
             f"Zoom: {motion['zoom_percent']:+.2f}% | "
@@ -582,7 +727,7 @@ while True:
         print(
             f"Frame {frame_number} | "
             f"Camera estimation failed | "
-            f"Players: {len(player_field_positions)}"
+            f"Players: {len(player_tracks)}"
         )
 
     if field_position is not None:
@@ -595,7 +740,7 @@ while True:
 
 
     # ========================================================
-    # 14. USER INPUT
+    # 15. USER INPUT
     # ========================================================
 
     key = cv2.waitKey(1) & 0xFF
@@ -605,9 +750,15 @@ while True:
 
     elif key == ord("r"):
 
-        print("Resetting ball tracker.")
+        print("Resetting ball and player trackers.")
 
         tracker.reset()
+
+        # >>> NEW
+        player_tracker = PlayerTracker(
+            max_distance=PLAYER_MAX_DISTANCE,
+            max_missed=PLAYER_MAX_MISSED
+        )
 
 
 # ============================================================
