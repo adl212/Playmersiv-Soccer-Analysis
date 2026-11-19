@@ -1,3 +1,131 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+
+
+# The user's trained pose model uses one 19-keypoint schema shared by
+# three detection classes. Indices are global within result.keypoints.data.
+CLASS_KEYPOINT_SCHEMA = {
+    0: (0, [
+        "center-circle-top",
+        "center-circle-right",
+        "center-circle-bottom",
+        "center-circle-left",
+        "center",
+    ]),
+    1: (5, [
+        "big-left-bottom-left",
+        "big-left-bottom-right",
+        "big-left-top-right",
+        "big-left-top-left",
+        "left-semicircle-left",
+        "left-semicircle-right",
+        "left-pk",
+    ]),
+    2: (12, [
+        "big-right-top-left",
+        "big-right-top-right",
+        "big-right-bottom-right",
+        "big-right-bottom-left",
+        "right-semicircle-left",
+        "right-semicircle-right",
+        "right-pk",
+    ]),
+}
+
+# Canonical pitch coordinates in percentage units, x from left to right,
+# y from top to bottom. The penalty-area and penalty-spot coordinates
+# preserve the coordinate convention previously used in this project.
+# Semicircle/box-line intersections are calculated from the standard
+# 9.15 m arc radius, 16.5 m penalty-area depth, and 11 m penalty spot.
+ARC_Y_TOP = 50.0 - (np.sqrt(9.15 ** 2 - (16.5 - 11.0) ** 2) / 68.0) * 100.0
+ARC_Y_BOTTOM = 100.0 - ARC_Y_TOP
+
+FIELD_POINTS_PERCENT = {
+    "center-circle-top": (50.0, 40.0),
+    "center-circle-right": (60.0, 50.0),
+    "center-circle-bottom": (50.0, 60.0),
+    "center-circle-left": (40.0, 50.0),
+    "center": (50.0, 50.0),
+
+    "big-left-bottom-left": (18.0, 79.647),
+    "big-left-bottom-right": (18.0, 20.353),
+    "big-left-top-right": (0.0, 20.353),
+    "big-left-top-left": (0.0, 79.647),
+    "left-semicircle-left": (18.0, ARC_Y_BOTTOM),
+    "left-semicircle-right": (18.0, ARC_Y_TOP),
+    "left-pk": (12.0, 50.0),
+
+    "big-right-top-left": (100.0, 20.353),
+    "big-right-top-right": (100.0, 79.647),
+    "big-right-bottom-right": (82.0, 79.647),
+    "big-right-bottom-left": (82.0, 20.353),
+    "right-semicircle-left": (82.0, ARC_Y_TOP),
+    "right-semicircle-right": (82.0, ARC_Y_BOTTOM),
+    "right-pk": (88.0, 50.0),
+}
+
+
+class LandmarkDetector:
+    """YOLO pose landmark detector and image-to-pitch homography estimator."""
+
+    def __init__(
+        self,
+        model_path="best_v7.pt",
+        pitch_width=1050,
+        pitch_height=680,
+        confidence=0.20,
+        keypoint_confidence=0.35,
+        ransac_threshold=10.0,
+        min_inliers=4,
+        max_mean_error=20.0,
+        min_pitch_coverage=0.01,
+        device=None,
+    ):
+        self.model = YOLO(model_path)
+        self.pitch_width = int(pitch_width)
+        self.pitch_height = int(pitch_height)
+        self.confidence = float(confidence)
+        self.keypoint_confidence = float(keypoint_confidence)
+        self.ransac_threshold = float(ransac_threshold)
+        self.min_inliers = int(min_inliers)
+        self.max_mean_error = float(max_mean_error)
+        self.min_pitch_coverage = float(min_pitch_coverage)
+        self.device = device
+
+        missing = set(FIELD_POINTS_PERCENT) - set(
+            name for _, names in CLASS_KEYPOINT_SCHEMA.values() for name in names
+        )
+        if missing:
+            raise ValueError(f"Missing keypoint schema entries: {sorted(missing)}")
+
+    def detect(self, frame):
+        """Return detected landmarks as a name -> observation dictionary."""
+        kwargs = {
+            "source": frame,
+            "conf": self.confidence,
+            "verbose": False,
+        }
+        if self.device is not None:
+            kwargs["device"] = self.device
+
+        result = self.model.predict(**kwargs)[0]
+        observations = {}
+
+        if result.keypoints is None or result.boxes is None:
+            return observations
+
+        keypoints = result.keypoints.data
+        classes = result.boxes.cls.detach().cpu().numpy().astype(int)
+        box_conf = result.boxes.conf.detach().cpu().numpy()
+
+        points = keypoints.detach().cpu().numpy()
+
+        for detection_index, class_id in enumerate(classes):
+            if class_id not in CLASS_KEYPOINT_SCHEMA:
+                continue
+
+            start, names = CLASS_KEYPOINT_SCHEMA[class_id]
             det_points = points[detection_index]
 
             for local_index, name in enumerate(names):
@@ -126,3 +254,5 @@
             cv2.putText(
                 output, name, (x + 5, y - 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 255), 1
+            )
+        return output
