@@ -367,12 +367,121 @@ def draw_players_on_pitch(pitch, player_positions):
 
     return pitch
 
+def draw_landmarks_on_pitch(
+    pitch,
+    detected_landmarks,
+    field_mapper
+):
+    """
+    Project detected image landmarks onto the 2D pitch.
 
+    detected_landmarks contains:
+        {
+            "name": landmark name,
+            "image_point": (x, y),
+            "score": confidence,
+            "class_id": class ID
+        }
+    """
+
+    if not detected_landmarks:
+        return pitch
+
+    for landmark in detected_landmarks:
+
+        image_point = landmark["image_point"]
+
+        # Transform image coordinates into normalized pitch coordinates.
+        field_position = field_mapper.image_to_field(
+            image_point
+        )
+
+        if field_position is None:
+            continue
+
+        field_x, field_y = field_position
+
+        if not (
+            np.isfinite(field_x) and
+            np.isfinite(field_y) and
+            0 <= field_x <= 1 and
+            0 <= field_y <= 1
+        ):
+            continue
+
+        # Convert normalized coordinates to pitch pixels.
+        pixel_x = int(field_x * (PITCH_WIDTH - 1))
+        pixel_y = int(field_y * (PITCH_HEIGHT - 1))
+
+        # Draw landmark point.
+        cv2.circle(
+            pitch,
+            (pixel_x, pixel_y),
+            6,
+            (0, 255, 255),
+            -1
+        )
+
+        # Draw white outline.
+        cv2.circle(
+            pitch,
+            (pixel_x, pixel_y),
+            6,
+            (255, 255, 255),
+            1
+        )
+
+        # Draw landmark name.
+        cv2.putText(
+            pitch,
+            landmark["name"],
+            (pixel_x + 8, pixel_y - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (255, 255, 255),
+            1
+        )
+
+    return pitch
+
+def transform_landmarks(landmarks, H):
+
+    if not landmarks or H is None:
+        return landmarks
+
+    transformed = []
+
+    for landmark in landmarks:
+
+        point = np.array(
+            [[landmark["image_point"]]],
+            dtype=np.float32
+        )
+
+        new_point = cv2.perspectiveTransform(
+            point,
+            H
+        )[0][0]
+
+        if not np.all(np.isfinite(new_point)):
+            continue
+
+        updated = landmark.copy()
+
+        updated["image_point"] = (
+            float(new_point[0]),
+            float(new_point[1])
+        )
+
+        transformed.append(updated)
+
+    return transformed
 # ============================================================
 # MAIN VIDEO LOOP
 # ============================================================
 
 frame_number = 0
+cached_landmarks = []
 
 while True:
 
@@ -455,7 +564,12 @@ while True:
             H_camera
         )
 
+    if camera_success and H_camera is not None:
 
+        cached_landmarks = transform_landmarks(
+            cached_landmarks,
+            H_camera
+        )
     # --------------------------------------------------------
     # B. Periodically recalibrate using automated landmarks
     # --------------------------------------------------------
@@ -475,6 +589,8 @@ while True:
             # Replace the propagated homography with the
             # newly estimated image-to-field homography.
             field_mapper.H_image_to_field = H_new
+
+            cached_landmarks = detected_landmarks
 
             print(
                 f"\n[LANDMARK RECALIBRATION] "
@@ -676,6 +792,12 @@ while True:
             field_position
         )
 
+        # Draw detected pitch landmarks.
+        pitch_view = draw_landmarks_on_pitch(
+            pitch_view,
+            cached_landmarks,
+            field_mapper
+        )
         # >>> UPDATED
         # Draw all Kalman-filtered player positions.
         # Orange = currently detected.
