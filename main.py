@@ -23,6 +23,8 @@ LANDMARK_MODEL_PATH = "best_v7.pt"
 # Re-estimate the field homography every 60 frames.
 LANDMARK_UPDATE_INTERVAL = 30
 
+VISUALIZE_LANDMARKS = True
+
 # Search up to 120 frames for the first successful calibration.
 INITIAL_CALIBRATION_SEARCH_FRAMES = 120
 
@@ -792,12 +794,13 @@ while True:
             field_position
         )
 
-        # Draw detected pitch landmarks.
-        pitch_view = draw_landmarks_on_pitch(
-            pitch_view,
-            cached_landmarks,
-            field_mapper
-        )
+        if VISUALIZE_LANDMARKS and cached_landmarks:
+            # Draw detected pitch landmarks.
+            pitch_view = draw_landmarks_on_pitch(
+                pitch_view,
+                cached_landmarks,
+                field_mapper
+            )
         # >>> UPDATED
         # Draw all Kalman-filtered player positions.
         # Orange = currently detected.
