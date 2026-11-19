@@ -23,6 +23,13 @@ LANDMARK_MODEL_PATH = "best_v7.pt"
 # Re-estimate the field homography every 60 frames.
 LANDMARK_UPDATE_INTERVAL = 30
 
+MIN_ACCEPTED_INLIERS = 4
+MAX_ACCEPTED_ERROR = 20.0
+
+# Difference between old and new homographies, in pitch pixels.
+MAX_MEDIAN_DISPLACEMENT = 40.0
+MAX_P90_DISPLACEMENT = 80.0
+
 VISUALIZE_LANDMARKS = True
 
 # Search up to 120 frames for the first successful calibration.
@@ -478,6 +485,90 @@ def transform_landmarks(landmarks, H):
         transformed.append(updated)
 
     return transformed
+
+def compare_homographies(H_old, H_new, landmarks):
+    """
+    Compare two image-to-field homographies using
+    the same current-frame image coordinates.
+
+    Returns median and 90th-percentile displacement
+    in canonical pitch pixels.
+    """
+
+    if H_old is None or H_new is None or not landmarks:
+        return None, None
+
+    points = np.array(
+        [lm["image_point"] for lm in landmarks],
+        dtype=np.float32
+    ).reshape(-1, 1, 2)
+
+    old_projection = cv2.perspectiveTransform(
+        points, H_old
+    )
+
+    new_projection = cv2.perspectiveTransform(
+        points, H_new
+    )
+
+    distances = np.linalg.norm(
+        old_projection - new_projection,
+        axis=2
+    ).flatten()
+
+    distances = distances[np.isfinite(distances)]
+
+    if len(distances) == 0:
+        return None, None
+
+    median_displacement = float(np.median(distances))
+    percentile_90 = float(np.percentile(distances, 90))
+
+    return median_displacement, percentile_90
+
+def accept_new_homography(
+    H_old,
+    H_new,
+    inlier_count,
+    mean_error,
+    landmarks,
+    camera_success
+):
+    """
+    Decide whether a new homography should replace
+    the currently propagated homography.
+    """
+
+    if H_new is None:
+        return False, "No valid homography"
+
+    if inlier_count < MIN_ACCEPTED_INLIERS:
+        return False, "Insufficient inliers"
+
+    if mean_error is None or mean_error > MAX_ACCEPTED_ERROR:
+        return False, "Reprojection error too high"
+
+    # If camera estimation worked, compare the new
+    # calibration against the camera-compensated old one.
+    if camera_success and H_old is not None:
+
+        median, p90 = compare_homographies(
+            H_old,
+            H_new,
+            landmarks
+        )
+
+        if median is None:
+            return False, "Could not compare homographies"
+
+        if median > MAX_MEDIAN_DISPLACEMENT:
+            return False, f"Median displacement too high: {median:.1f}px"
+
+        if p90 > MAX_P90_DISPLACEMENT:
+            return False, f"90th percentile displacement too high: {p90:.1f}px"
+
+    return True, "Accepted"
+
 # ============================================================
 # MAIN VIDEO LOOP
 # ============================================================
@@ -573,7 +664,7 @@ while True:
             H_camera
         )
     # --------------------------------------------------------
-    # B. Periodically recalibrate using automated landmarks
+    # B. Periodically detect landmarks
     # --------------------------------------------------------
 
     if frame_number % LANDMARK_UPDATE_INTERVAL == 0:
@@ -586,30 +677,40 @@ while True:
             detected_landmarks
         ) = landmark_detector.calibrate(frame)
 
-        if H_new is not None:
+        # Save the current propagated homography for comparison.
+        H_old = (
+            field_mapper.H_image_to_field.copy()
+            if field_mapper.H_image_to_field is not None
+            else None
+        )
 
-            # Replace the propagated homography with the
-            # newly estimated image-to-field homography.
+        accepted, reason = accept_new_homography(
+            H_old=H_old,
+            H_new=H_new,
+            inlier_count=inlier_count,
+            mean_error=mean_error,
+            landmarks=detected_landmarks,
+            camera_success=camera_success
+        )
+
+        if accepted:
+
             field_mapper.H_image_to_field = H_new
 
-            cached_landmarks = detected_landmarks
-
             print(
-                f"\n[LANDMARK RECALIBRATION] "
-                f"Frame: {frame_number} | "
+                f"\n[CALIBRATION ACCEPTED] "
+                f"Frame {frame_number} | "
                 f"Inliers: {inlier_count} | "
-                f"Mean error: {mean_error:.2f}"
+                f"Error: {mean_error:.2f}"
             )
 
         else:
 
-            # Keep the existing homography.
             print(
-                f"\n[LANDMARK RECALIBRATION] "
-                f"Frame: {frame_number} | "
-                f"Failed. Retaining previous homography."
+                f"\n[CALIBRATION REJECTED] "
+                f"Frame {frame_number} | "
+                f"Reason: {reason}"
             )
-
 
     # ========================================================
     # 6. UPDATE PLAYER TRACKER
