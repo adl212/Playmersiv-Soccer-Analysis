@@ -113,6 +113,7 @@ landmark_detector = LandmarkDetector(
     pitch_height=PITCH_HEIGHT
 )
 
+cached_landmarks = {}
 
 # ============================================================
 # INITIAL AUTOMATED CALIBRATION
@@ -170,7 +171,11 @@ if H_field is None:
         f"within {INITIAL_CALIBRATION_SEARCH_FRAMES} frames."
     )
 
-cached_landmarks = detected_landmarks
+cached_landmarks = {
+    landmark["name"]: landmark.copy()
+    for landmark in detected_landmarks
+}
+
 # Initialize the field mapper with the detected homography.
 field_mapper.H_image_to_field = H_field
 
@@ -569,6 +574,54 @@ def accept_new_homography(
 
     return True, "Accepted"
 
+def update_landmark_cache(cache, new_landmarks):
+    """
+    Update existing landmarks and add newly detected ones.
+
+    Each landmark is identified by its semantic name.
+    Fresh detections replace old coordinates.
+    """
+
+    for landmark in new_landmarks:
+
+        name = landmark["name"]
+
+        cache[name] = landmark.copy()
+
+    return cache
+
+
+def transform_landmark_cache(cache, H):
+    """
+    Transform cached landmark image coordinates
+    from the previous frame to the current frame.
+    """
+
+    if H is None:
+        return cache
+
+    for name, landmark in cache.items():
+
+        point = np.array(
+            [[landmark["image_point"]]],
+            dtype=np.float32
+        )
+
+        transformed = cv2.perspectiveTransform(
+            point,
+            H
+        )[0, 0]
+
+        if not np.all(np.isfinite(transformed)):
+            continue
+
+        landmark["image_point"] = (
+            float(transformed[0]),
+            float(transformed[1])
+        )
+
+    return cache
+
 # ============================================================
 # MAIN VIDEO LOOP
 # ============================================================
@@ -656,12 +709,16 @@ while True:
             H_camera
         )
 
+   # Keep previously detected landmarks aligned
+    # with the current video frame.
+
     if camera_success and H_camera is not None:
 
-        cached_landmarks = transform_landmarks(
+        cached_landmarks = transform_landmark_cache(
             cached_landmarks,
             H_camera
         )
+
     # --------------------------------------------------------
     # B. Periodically detect landmarks
     # --------------------------------------------------------
@@ -675,6 +732,14 @@ while True:
             mean_error,
             detected_landmarks
         ) = landmark_detector.calibrate(frame)
+
+        # Update landmark cache with fresh detections.
+        # Existing names are overwritten; missing names remain cached.
+
+        cached_landmarks = update_landmark_cache(
+            cached_landmarks,
+            detected_landmarks
+        )
 
         # Save the current propagated homography for comparison.
         H_old = (
@@ -897,7 +962,7 @@ while True:
             # Draw detected pitch landmarks.
             pitch_view = draw_landmarks_on_pitch(
                 pitch_view,
-                cached_landmarks,
+                list(cached_landmarks.values()),
                 field_mapper
             )
         # >>> UPDATED
