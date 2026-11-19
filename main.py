@@ -170,7 +170,7 @@ if H_field is None:
         f"within {INITIAL_CALIBRATION_SEARCH_FRAMES} frames."
     )
 
-
+cached_landmarks = detected_landmarks
 # Initialize the field mapper with the detected homography.
 field_mapper.H_image_to_field = H_field
 
@@ -574,7 +574,6 @@ def accept_new_homography(
 # ============================================================
 
 frame_number = 0
-cached_landmarks = []
 
 while True:
 
@@ -693,7 +692,7 @@ while True:
             camera_success=camera_success
         )
 
-        if accepted:
+        if accepted or frame_number == LANDMARK_UPDATE_INTERVAL:
 
             field_mapper.H_image_to_field = H_new
 
@@ -894,7 +893,6 @@ while True:
         pitch_view = pitch_visualizer.show(
             field_position
         )
-
         if VISUALIZE_LANDMARKS and cached_landmarks:
             # Draw detected pitch landmarks.
             pitch_view = draw_landmarks_on_pitch(
