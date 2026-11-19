@@ -7,7 +7,7 @@ from BallTracker import BallTracker
 from CameraMotionVisualizer import CameraMotionVisualizer
 from detect import BallDetector
 from field_mapper import FieldMapper
-from manual_calibration import ManualCalibration
+from LandmarkDetector import LandmarkDetector
 from pitch_visualizer import PitchVisualizer
 from player_tracker import PlayerTracker
 
@@ -17,6 +17,14 @@ from player_tracker import PlayerTracker
 
 VIDEO_PATH = "18eBfrhGS3BurZIDah6IcXVfDnbUaE5Jk.mp4"
 MODEL_PATH = "soccer_yolov8n_best (1).pt"
+
+LANDMARK_MODEL_PATH = "best_v7.pt"
+
+# Re-estimate the field homography every 60 frames.
+LANDMARK_UPDATE_INTERVAL = 30
+
+# Search up to 120 frames for the first successful calibration.
+INITIAL_CALIBRATION_SEARCH_FRAMES = 120
 
 # Change this to match your model's player class ID.
 PLAYER_CLASS_ID = 0
@@ -86,51 +94,85 @@ field_mapper = FieldMapper(
 )
 
 
-# Manual calibration
-calibrator = ManualCalibration(
+# ============================================================
+# AUTOMATED LANDMARK DETECTOR
+# ============================================================
+
+landmark_detector = LandmarkDetector(
+    model_path=LANDMARK_MODEL_PATH,
     pitch_width=PITCH_WIDTH,
     pitch_height=PITCH_HEIGHT
 )
 
 
 # ============================================================
-# INITIAL MANUAL CALIBRATION
+# INITIAL AUTOMATED CALIBRATION
 # ============================================================
 
-ret, first_frame = cap.read()
-
-if not ret:
-    cap.release()
-    raise RuntimeError("Could not read initial video frame.")
-
-
 print("\n===================================")
-print("       SOCCER FIELD CALIBRATION")
+print("     AUTOMATED FIELD CALIBRATION")
 print("===================================")
 
-print("\nSelect recognizable soccer field landmarks.")
-print("Press ENTER when finished.")
-print("Press U to undo.")
-print("Press R to reset.")
-print("Press ESC to cancel.")
+H_field = None
+calibrated_frame_number = None
+
+for offset in range(INITIAL_CALIBRATION_SEARCH_FRAMES + 1):
+
+    current_frame_number = first_frame_number + offset
+
+    ret, calibration_frame = cap.read()
+
+    if not ret:
+        break
+
+    (
+        landmark_result,
+        H,
+        inlier_count,
+        mean_error,
+        detected_landmarks
+    ) = landmark_detector.calibrate(calibration_frame)
+
+    if H is None:
+        print(
+            f"Frame {current_frame_number}: "
+            f"Calibration unsuccessful. Searching..."
+        )
+        continue
+
+    H_field = H
+    calibrated_frame_number = current_frame_number
+
+    print("\nInitial calibration successful!")
+    print(f"Frame: {calibrated_frame_number}")
+    print(f"Inliers: {inlier_count}")
+    print(f"Mean reprojection error: {mean_error:.2f}")
+
+    break
 
 
-calibration_result = calibrator.calibrate(first_frame)
+if H_field is None:
 
-if calibration_result is None:
     cap.release()
     cv2.destroyAllWindows()
-    raise RuntimeError("Field calibration cancelled.")
+
+    raise RuntimeError(
+        "Could not automatically calibrate the field "
+        f"within {INITIAL_CALIBRATION_SEARCH_FRAMES} frames."
+    )
 
 
-H_field, image_points, field_points = calibration_result
-
+# Initialize the field mapper with the detected homography.
 field_mapper.H_image_to_field = H_field
 
-print("\nField calibration successful.")
 
-# Restart video from the beginning.
-cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame_number)
+# Start processing from the frame used for calibration.
+cap.set(
+    cv2.CAP_PROP_POS_FRAMES,
+    calibrated_frame_number
+)
+
+print("Starting video processing...")
 
 
 # ============================================================
@@ -403,11 +445,52 @@ while True:
     # 5. UPDATE FIELD HOMOGRAPHY
     # ========================================================
 
+    # --------------------------------------------------------
+    # A. Propagate existing homography using camera movement
+    # --------------------------------------------------------
+
     if camera_success:
 
         field_mapper.update_camera_motion(
             H_camera
         )
+
+
+    # --------------------------------------------------------
+    # B. Periodically recalibrate using automated landmarks
+    # --------------------------------------------------------
+
+    if frame_number % LANDMARK_UPDATE_INTERVAL == 0:
+
+        (
+            landmark_result,
+            H_new,
+            inlier_count,
+            mean_error,
+            detected_landmarks
+        ) = landmark_detector.calibrate(frame)
+
+        if H_new is not None:
+
+            # Replace the propagated homography with the
+            # newly estimated image-to-field homography.
+            field_mapper.H_image_to_field = H_new
+
+            print(
+                f"\n[LANDMARK RECALIBRATION] "
+                f"Frame: {frame_number} | "
+                f"Inliers: {inlier_count} | "
+                f"Mean error: {mean_error:.2f}"
+            )
+
+        else:
+
+            # Keep the existing homography.
+            print(
+                f"\n[LANDMARK RECALIBRATION] "
+                f"Frame: {frame_number} | "
+                f"Failed. Retaining previous homography."
+            )
 
 
     # ========================================================

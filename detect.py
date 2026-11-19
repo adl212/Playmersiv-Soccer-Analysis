@@ -101,7 +101,7 @@ class BallDetector:
             # PLAYER DETECTION
             # -----------------------------------------
 
-            elif class_id == player_class_id:
+            elif class_id == player_class_id and confidence > 0.5:
 
                 bottom_center_x = (x1 + x2) / 2
                 bottom_center_y = y2
