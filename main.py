@@ -653,8 +653,38 @@ while True:
     # 2. CAMERA MOTION ESTIMATION
     # ========================================================
 
-    # Estimate previous-frame -> current-frame homography.
-    camera_result = camera.update(frame)
+    landmark_update = None
+    landmark_observations = None
+
+    # Seed the camera estimator with the landmarks from
+    # the initial successful calibration.
+    if frame_number == 1:
+
+        landmark_observations = list(
+            cached_landmarks.values()
+        )
+
+    # Periodically refresh semantic landmark detections.
+    elif frame_number % LANDMARK_UPDATE_INTERVAL == 0:
+
+        landmark_update = landmark_detector.calibrate(frame)
+
+        (
+            landmark_result,
+            H_new,
+            inlier_count,
+            mean_error,
+            detected_landmarks
+        ) = landmark_update
+
+        landmark_observations = detected_landmarks
+
+    # Estimate camera movement using semantic landmarks first,
+    # followed by tracked landmarks, followed by generic optical flow.
+    camera_result = camera.update(
+        frame,
+        landmarks=landmark_observations
+    )
 
     camera_success = camera_result["success"]
 
@@ -720,10 +750,10 @@ while True:
         )
 
     # --------------------------------------------------------
-    # B. Periodically detect landmarks
+    # B. Apply periodic landmark calibration
     # --------------------------------------------------------
 
-    if frame_number % LANDMARK_UPDATE_INTERVAL == 0:
+    if landmark_update is not None:
 
         (
             landmark_result,
@@ -731,17 +761,15 @@ while True:
             inlier_count,
             mean_error,
             detected_landmarks
-        ) = landmark_detector.calibrate(frame)
+        ) = landmark_update
 
-        # Update landmark cache with fresh detections.
-        # Existing names are overwritten; missing names remain cached.
-
+        # Refresh cached landmarks with fresh detections.
         cached_landmarks = update_landmark_cache(
             cached_landmarks,
             detected_landmarks
         )
 
-        # Save the current propagated homography for comparison.
+        # H_old has already been propagated into the current frame.
         H_old = (
             field_mapper.H_image_to_field.copy()
             if field_mapper.H_image_to_field is not None
@@ -754,10 +782,16 @@ while True:
             inlier_count=inlier_count,
             mean_error=mean_error,
             landmarks=detected_landmarks,
-            camera_success=camera_success
+            camera_success=(
+                camera_result["source"] in (
+                    "landmarks-detected",
+                    "landmarks-tracked"
+                )
+            )
         )
 
-        if accepted or frame_number == LANDMARK_UPDATE_INTERVAL:
+        # Never force a rejected calibration into the mapper.
+        if accepted:
 
             field_mapper.H_image_to_field = H_new
 
@@ -1087,6 +1121,7 @@ while True:
         print(
             f"Frame {frame_number} | "
             f"Players: {len(player_tracks)} | "
+            f"Source: {camera_result['source']} | "
             f"Pan X: {motion['translation_x']:.1f} | "
             f"Pan Y: {motion['translation_y']:.1f} | "
             f"Zoom: {motion['zoom_percent']:+.2f}% | "
