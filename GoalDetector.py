@@ -199,8 +199,6 @@ class GoalDetector:
             observed_ball_field_position: normalized (x, y) from the current
                 YOLO ball detection mapped to the pitch, or None. Do not pass
                 a Kalman-only prediction here as if it were an observation.
-            player_field_positions: iterable of normalized (x, y) positions
-                for currently detected players only.
             ball_missed_frames: BallTracker.missed_frames, for disappearance
                 evidence after a candidate trajectory.
         """
