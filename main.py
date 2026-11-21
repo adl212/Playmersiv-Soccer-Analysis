@@ -162,7 +162,6 @@ try:
         goal_result = goal_detector.update(
             frame_number=frame_number,
             observed_ball_field_position=observed_ball_field_position,
-            player_field_positions=player_field_positions,
             ball_missed_frames=ball_tracker.missed_frames,
         )
         if goal_result["goal"]:
