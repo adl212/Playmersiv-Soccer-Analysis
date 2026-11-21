@@ -74,6 +74,7 @@ print("Landmark model classes:", landmark_detector.model.names)
 frame_number = 0
 last_landmark_observations = {}
 last_calibration = None
+last_goal_event = None
 
 try:
     while True:
@@ -164,6 +165,21 @@ try:
             player_field_positions=player_field_positions,
             ball_missed_frames=ball_tracker.missed_frames,
         )
+        if goal_result["goal"]:
+            last_goal_event = {
+                "side": goal_result["goal_side"],
+                "frame": goal_result["event_frame"],
+                "until": frame_number + int(3.0 * video_fps),
+                "confidence": goal_result["confidence"],
+            }
+        goal_display_active = (
+            last_goal_event is not None
+            and frame_number <= last_goal_event["until"]
+        )
+        goal_label = (
+            f"GOAL CONFIRMED - {last_goal_event['side'].upper()}"
+            if goal_display_active else f"Goal detector: {goal_result['state']}"
+        )
 
         camera_view = frame.copy()
         if SHOW_LANDMARKS and last_landmark_observations:
@@ -199,18 +215,13 @@ try:
             )
 
         # Goal-event diagnostics on the camera view.
-        status_color = (0, 255, 0) if goal_result["goal"] else (0, 200, 255)
+        status_color = (0, 255, 0) if goal_display_active else (0, 200, 255)
         cv2.putText(
             camera_view,
-            f"Goal detector: {goal_result['state']} | {goal_result['reason']}",
+            f"{goal_label} | {goal_result['reason']}",
             (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.62, status_color, 2,
         )
         if goal_result["goal"]:
-            cv2.putText(
-                camera_view,
-                f"GOAL CONFIRMED - {goal_result['goal_side'].upper()}",
-                (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3,
-            )
             print(
                 f"GOAL CONFIRMED | frame={goal_result['event_frame']} | "
                 f"side={goal_result['goal_side']} | "
@@ -231,7 +242,7 @@ try:
                 )
             cv2.putText(
                 pitch_view,
-                f"Goal: {goal_result['state']}",
+                f"{goal_label}",
                 (15, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                 status_color, 2,
             )
