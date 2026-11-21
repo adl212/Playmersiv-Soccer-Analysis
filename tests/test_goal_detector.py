@@ -13,7 +13,7 @@ def test_confirms_goal_after_goal_area_evidence_and_center_restart():
     ]
     result = None
     for frame, point in observations:
-        result = detector.update(frame, point, player_field_positions=[])
+        result = detector.update(frame, point)
 
     assert result["state"] == detector.GOAL_CANDIDATE
     assert result["goal_area_evidence"] is True
