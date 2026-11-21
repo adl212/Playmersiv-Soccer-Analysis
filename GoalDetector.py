@@ -165,15 +165,11 @@ class GoalDetector:
             and frame_number - self.kickoff_armed_frame <= self.kickoff_max_frames
             and self._distance(observed_ball, self.kickoff_anchor) >= self.kickoff_move_threshold
         ):
-            left = sum(1 for p in players if p[0] < 0.5)
-            right = sum(1 for p in players if p[0] >= 0.5)
-            distribution_ok = (
-                left >= self.min_players_each_half
-                and right >= self.min_players_each_half
-            )
-            # Distribution raises confidence but is not a hard requirement.
+            # Player distribution is intentionally not required: a broadcast
+            # crop can hide one half of the pitch. The center restart is the
+            # primary confirmation cue.
             self._reset_kickoff()
-            return True if distribution_ok or len(players) < 2 else True
+            return True
 
         if (
             self.kickoff_armed_frame is not None
