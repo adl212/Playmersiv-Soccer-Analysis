@@ -9,6 +9,7 @@ from field_mapper import FieldMapper
 from pitch_visualizer import PitchVisualizer
 from player_tracker import PlayerTracker
 from LandmarkDetector import LandmarkDetector
+from GoalDetector import GoalDetector
 from helper import (
     get_raw_prediction,
     get_compensated_prediction,
@@ -62,6 +63,10 @@ landmark_detector = LandmarkDetector(
 camera_visualizer = CameraMotionVisualizer()
 pitch_visualizer = PitchVisualizer(width=PITCH_WIDTH, height=PITCH_HEIGHT)
 field_mapper = FieldMapper(pitch_width=PITCH_WIDTH, pitch_height=PITCH_HEIGHT)
+video_fps = cap.get(cv2.CAP_PROP_FPS)
+if not np.isfinite(video_fps) or video_fps <= 1:
+    video_fps = 30.0
+goal_detector = GoalDetector(fps=video_fps)
 
 print("Object detector classes:", detector.model.names)
 print("Landmark model classes:", landmark_detector.model.names)
@@ -146,6 +151,20 @@ try:
             if ball_position is not None else None
         )
 
+        # Goal detection uses only a CURRENT YOLO ball observation for its
+        # trajectory history; Kalman-only predictions are never treated as
+        # observed ball positions. This avoids confirming goals from drift.
+        observed_ball_field_position = (
+            map_track_to_field(ball_detection, field_mapper)
+            if ball_detection is not None else None
+        )
+        goal_result = goal_detector.update(
+            frame_number=frame_number,
+            observed_ball_field_position=observed_ball_field_position,
+            player_field_positions=player_field_positions,
+            ball_missed_frames=ball_tracker.missed_frames,
+        )
+
         camera_view = frame.copy()
         if SHOW_LANDMARKS and last_landmark_observations:
             camera_view = draw_landmarks(camera_view, last_landmark_observations)
@@ -179,6 +198,25 @@ try:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
             )
 
+        # Goal-event diagnostics on the camera view.
+        status_color = (0, 255, 0) if goal_result["goal"] else (0, 200, 255)
+        cv2.putText(
+            camera_view,
+            f"Goal detector: {goal_result['state']} | {goal_result['reason']}",
+            (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.62, status_color, 2,
+        )
+        if goal_result["goal"]:
+            cv2.putText(
+                camera_view,
+                f"GOAL CONFIRMED - {goal_result['goal_side'].upper()}",
+                (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3,
+            )
+            print(
+                f"GOAL CONFIRMED | frame={goal_result['event_frame']} | "
+                f"side={goal_result['goal_side']} | "
+                f"confidence={goal_result['confidence']:.2f}"
+            )
+
         if SHOW_PITCH:
             pitch_view = pitch_visualizer.show(ball_field_position)
             for player in player_field_positions:
@@ -191,6 +229,12 @@ try:
                     pitch_view, str(player["id"]), (px + 10, py - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
                 )
+            cv2.putText(
+                pitch_view,
+                f"Goal: {goal_result['state']}",
+                (15, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                status_color, 2,
+            )
             cv2.putText(
                 pitch_view,
                 f"Players: {len(player_tracks)}",
@@ -234,6 +278,7 @@ try:
         if key == ord("r"):
             print("Resetting object trackers and camera motion.")
             ball_tracker.reset()
+            goal_detector.reset()
             player_tracker = PlayerTracker(
                 max_distance=PLAYER_MAX_DISTANCE,
                 max_missed=PLAYER_MAX_MISSED,
