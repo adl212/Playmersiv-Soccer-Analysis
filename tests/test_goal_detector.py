@@ -25,7 +25,7 @@ def test_confirms_goal_after_goal_area_evidence_and_center_restart():
     detector.update(10, (0.50, 0.50), player_field_positions=[])
     detector.update(11, (0.50, 0.50), player_field_positions=[])
     detector.update(12, (0.50, 0.50), player_field_positions=[])
-    result = detector.update(13, (0.55, 0.50), player_field_positions=[])
+    result = detector.update(13, (0.60, 0.50), player_field_positions=[])
 
     assert result["goal"] is True
     assert result["goal_side"] == "left"
