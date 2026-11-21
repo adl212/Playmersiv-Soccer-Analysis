@@ -50,7 +50,6 @@ class GoalDetector:
         self.goal_area_evidence = False
         self.candidate_reason = None
 
-        self.center_observations = deque(maxlen=8)
         self.kickoff_anchor = None
         self.kickoff_stationary_count = 0
         self.kickoff_armed_frame = None
@@ -133,7 +132,6 @@ class GoalDetector:
         near_center = self._distance(observed_ball, center) <= self.kickoff_center_radius
 
         if near_center:
-            self.center_observations.append((frame_number, observed_ball))
             if self.kickoff_anchor is None:
                 self.kickoff_anchor = observed_ball
                 self.kickoff_stationary_count = 1
@@ -180,7 +178,6 @@ class GoalDetector:
         self.kickoff_anchor = None
         self.kickoff_stationary_count = 0
         self.kickoff_armed_frame = None
-        self.center_observations.clear()
 
     def _reset_candidate(self):
         self.state = self.IDLE
