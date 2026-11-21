@@ -31,7 +31,6 @@ class GoalDetector:
         kickoff_move_threshold=0.025,
         kickoff_stationary_frames=3,
         kickoff_max_frames=45,
-        min_players_each_half=1,
     ):
         self.fps = max(1.0, float(fps))
         self.goal_line_x_margin = float(goal_line_x_margin)
@@ -43,7 +42,6 @@ class GoalDetector:
         self.kickoff_move_threshold = float(kickoff_move_threshold)
         self.kickoff_stationary_frames = int(kickoff_stationary_frames)
         self.kickoff_max_frames = int(kickoff_max_frames)
-        self.min_players_each_half = int(min_players_each_half)
 
         self.ball_history = deque(maxlen=8)
         self.state = self.IDLE
@@ -122,7 +120,7 @@ class GoalDetector:
             "speed": speed,
         }
 
-    def _update_kickoff_detector(self, frame_number, observed_ball, players):
+    def _update_kickoff_detector(self, frame_number, observed_ball):
         """
         Detect a restart as: ball observed near center, remains there briefly,
         then moves away. Player distribution is a supporting (not mandatory)
@@ -196,7 +194,6 @@ class GoalDetector:
         self,
         frame_number,
         observed_ball_field_position,
-        player_field_positions=None,
         ball_missed_frames=0,
     ):
         """
@@ -210,17 +207,6 @@ class GoalDetector:
             ball_missed_frames: BallTracker.missed_frames, for disappearance
                 evidence after a candidate trajectory.
         """
-        players = []
-        for item in player_field_positions or []:
-            if isinstance(item, dict):
-                if not item.get("detected", True):
-                    continue
-                point = item.get("position")
-            else:
-                point = item
-            if point is not None:
-                players.append((float(point[0]), float(point[1])))
-
         observed = None
         if observed_ball_field_position is not None:
             x, y = map(float, observed_ball_field_position)
@@ -275,7 +261,7 @@ class GoalDetector:
                     self.state = self.GOAL_CANDIDATE
                     self.candidate_reason = "ball-lost-near-projected-goal"
 
-        kickoff = self._update_kickoff_detector(frame_number, observed, players)
+        kickoff = self._update_kickoff_detector(frame_number, observed)
 
         if (
             kickoff
