@@ -19,13 +19,13 @@ def test_confirms_goal_after_goal_area_evidence_and_center_restart():
     assert result["goal_area_evidence"] is True
 
     # Ball is temporarily not observed after reaching the goal area.
-    detector.update(5, None, player_field_positions=[], ball_missed_frames=2)
+    detector.update(5, None, ball_missed_frames=2)
 
     # A restart is observed at the center spot: stationary, then moved.
-    detector.update(10, (0.50, 0.50), player_field_positions=[])
-    detector.update(11, (0.50, 0.50), player_field_positions=[])
-    detector.update(12, (0.50, 0.50), player_field_positions=[])
-    result = detector.update(13, (0.60, 0.50), player_field_positions=[])
+    detector.update(10, (0.50, 0.50))
+    detector.update(11, (0.50, 0.50))
+    detector.update(12, (0.50, 0.50))
+    result = detector.update(13, (0.60, 0.50))
 
     assert result["goal"] is True
     assert result["goal_side"] == "left"
