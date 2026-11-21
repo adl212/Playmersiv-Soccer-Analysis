@@ -290,6 +290,7 @@ try:
             print("Resetting object trackers and camera motion.")
             ball_tracker.reset()
             goal_detector.reset()
+            last_goal_event = None
             player_tracker = PlayerTracker(
                 max_distance=PLAYER_MAX_DISTANCE,
                 max_missed=PLAYER_MAX_MISSED,
