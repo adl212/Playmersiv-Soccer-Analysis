@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 
 
 class CameraMotionEstimator:
@@ -13,16 +14,17 @@ class CameraMotionEstimator:
 
     def __init__(
         self,
-        max_features=1200,
+        max_features=500,
         quality_level=0.01,
         min_distance=8,
         ransac_threshold=4.0,
         min_inliers=4,
-        feature_interval=10,
+        feature_interval=20,
         fb_threshold=1.5,
         min_inlier_ratio=0.5,
         min_image_coverage=0.0015,
         max_median_error=5.0,
+        profile_interval=30,
     ):
         self.max_features = max_features
         self.quality_level = quality_level
@@ -34,6 +36,10 @@ class CameraMotionEstimator:
         self.min_inlier_ratio = min_inlier_ratio
         self.min_image_coverage = min_image_coverage
         self.max_median_error = max_median_error
+        self.profile_interval = max(1, int(profile_interval))
+        self._profile_totals = {}
+        self._profile_frames = 0
+        self._dilation_kernels = {}
 
         self.prev_gray = None
         self.prev_pts = None
@@ -70,7 +76,12 @@ class CameraMotionEstimator:
             cv2.fillConvexPoly(mask, hull, 255)
             # Expand the landmark hull to include nearby grass texture.
             radius = max(25, int(min(gray.shape) * 0.06))
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+            kernel = self._dilation_kernels.get(radius)
+            if kernel is None:
+                kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+                )
+                self._dilation_kernels[radius] = kernel
             return cv2.dilate(mask, kernel)
         return None
 
@@ -182,24 +193,69 @@ class CameraMotionEstimator:
             "success": bool(success),
         }
 
+    @staticmethod
+    def _record_timing(timings, name, stage_start):
+        timings[name] = timings.get(name, 0.0) + (
+            time.perf_counter() - stage_start
+        ) * 1000
+
+    def _finish_profile(self, timings, frame_start):
+        timings["total"] = (time.perf_counter() - frame_start) * 1000
+        for name, duration_ms in timings.items():
+            total, count = self._profile_totals.get(name, (0.0, 0))
+            self._profile_totals[name] = (total + duration_ms, count + 1)
+
+        self._profile_frames += 1
+        if self._profile_frames >= self.profile_interval:
+            details = " | ".join(
+                f"{name}={total / count:.2f}ms"
+                for name, (total, count) in self._profile_totals.items()
+            )
+            print(
+                f"[CAMERA PROFILE] avg over {self._profile_frames} updates: "
+                f"{details}"
+            )
+            self._profile_totals.clear()
+            self._profile_frames = 0
+
     def update(self, frame, mask=None, landmarks=None):
+        frame_start = time.perf_counter()
+        timings = {}
+
+        stage_start = time.perf_counter()
         gray = self._gray(frame)
+        self._record_timing(timings, "grayscale", stage_start)
+
+        stage_start = time.perf_counter()
         observed = self._clean_landmarks(landmarks)
+        self._record_timing(timings, "landmark_cleaning", stage_start)
 
         if self.prev_gray is None:
             self.prev_gray = gray
             self.prev_landmarks = observed
+            stage_start = time.perf_counter()
             self.prev_mask = self._feature_mask(gray, observed, mask)
+            self._record_timing(timings, "feature_mask", stage_start)
+            stage_start = time.perf_counter()
             self.prev_pts = self._detect_features(gray, self.prev_mask)
-            return self._result(np.eye(3), False, 0, "initialized")
+            self._record_timing(timings, "feature_detection", stage_start)
+            stage_start = time.perf_counter()
+            result = self._result(np.eye(3), False, 0, "initialized")
+            self._record_timing(timings, "result", stage_start)
+            self._finish_profile(timings, frame_start)
+            result["timings_ms"] = dict(timings)
+            return result
 
         # Track semantic landmarks from previous frame.
+        stage_start = time.perf_counter()
         tracked_old, tracked_new = self._track_points(
             list(self.prev_landmarks.values()), gray
         ) if self.prev_landmarks else (
             np.empty((0, 2), np.float32), np.empty((0, 2), np.float32)
         )
+        self._record_timing(timings, "semantic_tracking", stage_start)
 
+        stage_start = time.perf_counter()
         tracked_names = []
         if self.prev_landmarks and len(tracked_new):
             # Track in stable insertion order to retain semantic identity.
@@ -218,6 +274,7 @@ class CameraMotionEstimator:
 
         # Fresh detector results re-anchor semantic point positions.
         current_landmarks.update(observed)
+        self._record_timing(timings, "landmark_association", stage_start)
 
         common = [
             name for name in self.prev_landmarks
@@ -229,7 +286,9 @@ class CameraMotionEstimator:
         if len(common) >= self.min_inliers:
             old_semantic = np.asarray([self.prev_landmarks[n] for n in common], np.float32)
             new_semantic = np.asarray([current_landmarks[n] for n in common], np.float32)
+            stage_start = time.perf_counter()
             H, inliers, error = self._estimate(old_semantic, new_semantic)
+            self._record_timing(timings, "semantic_homography", stage_start)
             if H is not None:
                 source = "landmarks-detected" if observed else "landmarks-tracked"
 
@@ -240,35 +299,64 @@ class CameraMotionEstimator:
                 or len(self.prev_pts) < 8
                 or self.frame_count % self.feature_interval == 0
             ):
+                if self.prev_mask is None:
+                    stage_start = time.perf_counter()
+                    self.prev_mask = self._feature_mask(
+                        self.prev_gray, self.prev_landmarks, None
+                    )
+                    self._record_timing(timings, "feature_mask", stage_start)
+                stage_start = time.perf_counter()
                 self.prev_pts = self._detect_features(self.prev_gray, self.prev_mask)
+                self._record_timing(timings, "feature_detection", stage_start)
 
+            stage_start = time.perf_counter()
             old, new = self._track_points(self.prev_pts, gray)
+            self._record_timing(timings, "feature_tracking", stage_start)
             if len(old) >= 8:
+                stage_start = time.perf_counter()
                 H, inliers, error = self._estimate(old, new, min_inliers=8)
+                self._record_timing(timings, "feature_homography", stage_start)
                 if H is not None:
                     source = "optical-flow"
 
             if H is not None:
                 self.prev_pts = new.reshape(-1, 1, 2)
             else:
+                stage_start = time.perf_counter()
+                feature_mask = self._feature_mask(gray, current_landmarks, mask)
+                self._record_timing(timings, "feature_mask", stage_start)
+                self.prev_mask = feature_mask
+                stage_start = time.perf_counter()
                 self.prev_pts = self._detect_features(
-                    gray, self._feature_mask(gray, current_landmarks, mask)
+                    gray, feature_mask
                 )
+                self._record_timing(timings, "feature_detection", stage_start)
 
         success = H is not None
         if success:
+            stage_start = time.perf_counter()
             try:
                 self.cumulative_H = self.cumulative_H @ np.linalg.inv(H)
                 self.cumulative_H /= self.cumulative_H[2, 2]
             except (np.linalg.LinAlgError, ZeroDivisionError):
                 success = False
+            self._record_timing(timings, "cumulative_transform", stage_start)
 
+        stage_start = time.perf_counter()
         self.prev_gray = gray
         self.prev_landmarks = current_landmarks
-        self.prev_mask = self._feature_mask(gray, current_landmarks, mask)
         self.frame_count += 1
+        self._record_timing(timings, "state_update", stage_start)
 
-        return self._result(H if success else np.eye(3), success, inliers, source, error)
+        if H is not None:
+            self.prev_mask = mask.copy() if mask is not None else None
+
+        stage_start = time.perf_counter()
+        result = self._result(H if success else np.eye(3), success, inliers, source, error)
+        self._record_timing(timings, "result", stage_start)
+        self._finish_profile(timings, frame_start)
+        result["timings_ms"] = dict(timings)
+        return result
 
     def reset(self):
         self.prev_gray = None
@@ -277,3 +365,5 @@ class CameraMotionEstimator:
         self.prev_landmarks = {}
         self.frame_count = 0
         self.cumulative_H = np.eye(3, dtype=np.float64)
+        self._profile_totals.clear()
+        self._profile_frames = 0

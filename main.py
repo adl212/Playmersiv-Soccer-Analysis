@@ -10,6 +10,7 @@ from pitch_visualizer import PitchVisualizer
 from player_tracker import PlayerTracker
 from LandmarkDetector import LandmarkDetector
 from GoalDetector import GoalDetector
+import time
 from helper import (
     get_raw_prediction,
     get_compensated_prediction,
@@ -23,13 +24,14 @@ VIDEO_PATH = "18eBfrhGS3BurZIDah6IcXVfDnbUaE5Jk.mp4"
 MODEL_PATH = "soccer_yolov8n_best (1).pt"
 LANDMARK_MODEL_PATH = "best_v7.pt"
 
-FIRST_FRAME = 95000
+FIRST_FRAME = 95000#122900
 PLAYER_CLASS_ID = 0
 PITCH_WIDTH, PITCH_HEIGHT = 1050, 680
-BALL_CONFIDENCE = 0.25
+BALL_CONFIDENCE = 0.5
 LANDMARK_CONFIDENCE = 0.20
 KEYPOINT_CONFIDENCE = 0.35
 LANDMARK_UPDATE_INTERVAL = 15
+PROFILE_EVERY_N_FRAMES = 30
 
 SHOW_CAMERA_MOTION = True
 SHOW_PITCH = True
@@ -71,6 +73,37 @@ goal_detector = GoalDetector(fps=video_fps)
 print("Object detector classes:", detector.model.names)
 print("Landmark model classes:", landmark_detector.model.names)
 
+profile_stage_names = (
+    "read", "detector", "landmarks", "camera", "tracking_mapping",
+    "render", "console", "waitKey", "total",
+)
+profile_totals = dict.fromkeys(profile_stage_names, 0.0)
+profile_frames = 0
+
+
+def record_profile_stage(name, stage_start):
+    profile_totals[name] += time.perf_counter() - stage_start
+
+
+def report_profile():
+    if profile_frames == 0:
+        return
+    averages_ms = {
+        name: profile_totals[name] * 1000 / profile_frames
+        for name in profile_stage_names
+    }
+    average_frame_ms = averages_ms["total"]
+    approximate_fps = 1000 / average_frame_ms if average_frame_ms > 0 else 0
+    details = " | ".join(
+        f"{name}={averages_ms[name]:.1f}ms"
+        for name in profile_stage_names
+        if name != "total"
+    )
+    print(
+        f"[PROFILE] avg over {profile_frames} frames: {details} | "
+        f"total={average_frame_ms:.1f}ms ({approximate_fps:.1f} FPS)"
+    )
+
 frame_number = 0
 last_landmark_observations = {}
 last_calibration = None
@@ -78,15 +111,21 @@ last_goal_event = None
 
 try:
     while True:
+        frame_start = time.perf_counter()
+        stage_start = frame_start
         ret, frame = cap.read()
         if not ret:
             break
+        record_profile_stage("read", stage_start)
         frame_number += 1
+        profile_frames += 1
 
         # Run the object detector every frame.
+        stage_start = time.perf_counter()
         ball_detection, player_positions = detector.get_detections(
             frame, player_class_id=PLAYER_CLASS_ID
         )
+        record_profile_stage("detector", stage_start)
 
         # Run the landmark model sparsely. On intervening frames, the
         # CameraMotionEstimator tracks semantic points with optical flow.
@@ -96,18 +135,23 @@ try:
             or frame_number % LANDMARK_UPDATE_INTERVAL == 0
         )
         calibration = None
+        stage_start = time.perf_counter()
         if run_landmark_model:
             calibration = landmark_detector.calibrate(frame)
             last_landmark_observations = calibration["observations"]
             last_calibration = calibration
+        record_profile_stage("landmarks", stage_start)
 
+        stage_start = time.perf_counter()
         camera_result = camera.update(
             frame,
             landmarks=last_landmark_observations if run_landmark_model else None,
         )
+        record_profile_stage("camera", stage_start)
         camera_success = camera_result["success"]
         H_camera = camera_result["homography"] if camera_success else None
 
+        stage_start = time.perf_counter()
         # The old image->pitch homography is propagated into this frame
         # using the inverse of the previous->current camera transform.
         if camera_success and field_mapper.H_image_to_field is not None:
@@ -179,7 +223,9 @@ try:
             f"GOAL CONFIRMED - {last_goal_event['side'].upper()}"
             if goal_display_active else f"Goal detector: {goal_result['state']}"
         )
+        record_profile_stage("tracking_mapping", stage_start)
 
+        stage_start = time.perf_counter()
         camera_view = frame.copy()
         if SHOW_LANDMARKS and last_landmark_observations:
             camera_view = draw_landmarks(camera_view, last_landmark_observations)
@@ -254,7 +300,9 @@ try:
             cv2.imshow("Top Down Soccer Field", pitch_view)
 
         cv2.imshow("Camera Motion + Ball + Player Tracking", camera_view)
+        record_profile_stage("render", stage_start)
 
+        stage_start = time.perf_counter()
         if calibration is not None:
             print(
                 f"Frame {frame_number}: landmark calibration "
@@ -263,6 +311,7 @@ try:
                 f"inliers={calibration['inliers']} | "
                 f"mean_error={calibration['mean_error']} | "
                 f"coverage={calibration['coverage']:.3f}"
+                f"time={time.perf_counter() - frame_start:.3f}s"
             )
 
         if camera_success:
@@ -275,14 +324,26 @@ try:
                 f"{motion['translation_y']:.1f}) | "
                 f"zoom={motion['zoom_percent']:+.2f}% | "
                 f"rotation={motion['rotation_degrees']:.2f}"
+                f"time={time.perf_counter() - frame_start:.3f}s"
             )
         else:
             print(
                 f"Frame {frame_number} | camera estimation failed "
                 f"({camera_result['source']}) | players={len(player_tracks)}"
             )
+        record_profile_stage("console", stage_start)
 
+        stage_start = time.perf_counter()
         key = cv2.waitKey(1) & 0xFF
+        record_profile_stage("waitKey", stage_start)
+        record_profile_stage("total", frame_start)
+
+        if frame_number % PROFILE_EVERY_N_FRAMES == 0:
+            report_profile()
+            for name in profile_stage_names:
+                profile_totals[name] = 0.0
+            profile_frames = 0
+
         if key == ord("q"):
             break
         if key == ord("r"):
@@ -302,4 +363,5 @@ finally:
     cap.release()
     cv2.destroyAllWindows()
 
+report_profile()
 print("Video processing complete.")
