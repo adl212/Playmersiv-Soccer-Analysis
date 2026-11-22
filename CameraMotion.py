@@ -18,12 +18,13 @@ class CameraMotionEstimator:
         quality_level=0.01,
         min_distance=8,
         ransac_threshold=4.0,
-        min_inliers=4,
+        min_inliers=6,
         feature_interval=20,
         fb_threshold=1.5,
         min_inlier_ratio=0.5,
         min_image_coverage=0.0015,
         max_median_error=5.0,
+        max_frame_motion_ratio=0.2,
         profile_interval=30,
     ):
         self.max_features = max_features
@@ -36,6 +37,7 @@ class CameraMotionEstimator:
         self.min_inlier_ratio = min_inlier_ratio
         self.min_image_coverage = min_image_coverage
         self.max_median_error = max_median_error
+        self.max_frame_motion_ratio = max_frame_motion_ratio
         self.profile_interval = max(1, int(profile_interval))
         self._profile_totals = {}
         self._profile_frames = 0
@@ -146,6 +148,32 @@ class CameraMotionEstimator:
         count = int(inliers.sum())
         ratio = count / max(1, len(old_points))
         if count < min_inliers or ratio < self.min_inlier_ratio:
+            return None, count, None
+
+        frame_height, frame_width = self.prev_gray.shape[:2]
+        frame_corners = np.array(
+            [[
+                [0, 0],
+                [frame_width - 1, 0],
+                [frame_width - 1, frame_height - 1],
+                [0, frame_height - 1],
+            ]],
+            dtype=np.float32,
+        )
+        projected_corners = cv2.perspectiveTransform(
+            frame_corners, H
+        ).reshape(-1, 2)
+        corner_displacements = np.linalg.norm(
+            projected_corners - frame_corners.reshape(-1, 2), axis=1
+        )
+        max_corner_displacement = float(np.max(corner_displacements))
+        max_allowed_displacement = (
+            np.hypot(frame_width, frame_height) * self.max_frame_motion_ratio
+        )
+        if (
+            not np.all(np.isfinite(projected_corners))
+            or max_corner_displacement > max_allowed_displacement
+        ):
             return None, count, None
 
         hull = cv2.convexHull(np.asarray(new_points, np.float32)[inliers])
