@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 
@@ -7,765 +6,362 @@ from BallTracker import BallTracker
 from CameraMotionVisualizer import CameraMotionVisualizer
 from detect import BallDetector
 from field_mapper import FieldMapper
-from manual_calibration import ManualCalibration
 from pitch_visualizer import PitchVisualizer
 from player_tracker import PlayerTracker
+from LandmarkDetector import LandmarkDetector
+from GoalDetector import GoalDetector
+import time
+from helper import (
+    get_raw_prediction,
+    get_compensated_prediction,
+    transform_point,
+    map_track_to_field,
+    draw_landmarks,
+)
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
+# ------------------------------- CONFIG -------------------------------
 VIDEO_PATH = "18eBfrhGS3BurZIDah6IcXVfDnbUaE5Jk.mp4"
 MODEL_PATH = "soccer_yolov8n_best (1).pt"
+LANDMARK_MODEL_PATH = "best_v7.pt"
 
-# Change this to match your model's player class ID.
+FIRST_FRAME = 95000#122900
 PLAYER_CLASS_ID = 0
-
-PITCH_WIDTH = 1050
-PITCH_HEIGHT = 680
-
-BALL_CONFIDENCE = 0.25
+PITCH_WIDTH, PITCH_HEIGHT = 1050, 680
+BALL_CONFIDENCE = 0.5
+LANDMARK_CONFIDENCE = 0.20
+KEYPOINT_CONFIDENCE = 0.35
+LANDMARK_UPDATE_INTERVAL = 15
+PROFILE_EVERY_N_FRAMES = 30
 
 SHOW_CAMERA_MOTION = True
 SHOW_PITCH = True
-
+SHOW_LANDMARKS = True
 PLAYER_MAX_DISTANCE = 100
 PLAYER_MAX_MISSED = 15
-# Maximum distance between a predicted ball position
-# and YOLO detection before rejecting that detection.
-# This is configured in ball_tracker.py.
 
-
-# ============================================================
-# INITIALIZATION
-# ============================================================
+# A fresh absolute field calibration is accepted only when its own
+# geometric validation passes in LandmarkDetector.
+# ----------------------------------------------------------------------
 
 cap = cv2.VideoCapture(VIDEO_PATH)
-
 if not cap.isOpened():
     raise RuntimeError(f"Could not open video: {VIDEO_PATH}")
+cap.set(cv2.CAP_PROP_POS_FRAMES, FIRST_FRAME)
 
-first_frame_number = 95000
-cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame_number)
-
-# Camera motion estimator
 camera = CameraMotionEstimator()
-
-
-# Ball tracker
-tracker = BallTracker()
-
-# Player tracker
+ball_tracker = BallTracker()
 player_tracker = PlayerTracker(
     max_distance=PLAYER_MAX_DISTANCE,
-    max_missed=PLAYER_MAX_MISSED
+    max_missed=PLAYER_MAX_MISSED,
 )
-
-# YOLO detector
-detector = BallDetector(
-    model_path=MODEL_PATH,
-    confidence=BALL_CONFIDENCE
+detector = BallDetector(model_path=MODEL_PATH, confidence=BALL_CONFIDENCE)
+landmark_detector = LandmarkDetector(
+    model_path=LANDMARK_MODEL_PATH,
+    pitch_width=PITCH_WIDTH,
+    pitch_height=PITCH_HEIGHT,
+    confidence=LANDMARK_CONFIDENCE,
+    keypoint_confidence=KEYPOINT_CONFIDENCE,
 )
-
-print("YOLO classes:", detector.model.names)
-
-
-# Visualizers
 camera_visualizer = CameraMotionVisualizer()
+pitch_visualizer = PitchVisualizer(width=PITCH_WIDTH, height=PITCH_HEIGHT)
+field_mapper = FieldMapper(pitch_width=PITCH_WIDTH, pitch_height=PITCH_HEIGHT)
+video_fps = cap.get(cv2.CAP_PROP_FPS)
+if not np.isfinite(video_fps) or video_fps <= 1:
+    video_fps = 30.0
+goal_detector = GoalDetector(fps=video_fps)
 
-pitch_visualizer = PitchVisualizer(
-    width=PITCH_WIDTH,
-    height=PITCH_HEIGHT
+print("Object detector classes:", detector.model.names)
+print("Landmark model classes:", landmark_detector.model.names)
+
+profile_stage_names = (
+    "read", "detector", "landmarks", "camera", "tracking_mapping",
+    "render", "console", "waitKey", "total",
 )
+profile_totals = dict.fromkeys(profile_stage_names, 0.0)
+profile_frames = 0
 
 
-# Field mapper
-field_mapper = FieldMapper(
-    pitch_width=PITCH_WIDTH,
-    pitch_height=PITCH_HEIGHT
-)
+def record_profile_stage(name, stage_start):
+    profile_totals[name] += time.perf_counter() - stage_start
 
 
-# Manual calibration
-calibrator = ManualCalibration(
-    pitch_width=PITCH_WIDTH,
-    pitch_height=PITCH_HEIGHT
-)
-
-
-# ============================================================
-# INITIAL MANUAL CALIBRATION
-# ============================================================
-
-ret, first_frame = cap.read()
-
-if not ret:
-    cap.release()
-    raise RuntimeError("Could not read initial video frame.")
-
-
-print("\n===================================")
-print("       SOCCER FIELD CALIBRATION")
-print("===================================")
-
-print("\nSelect recognizable soccer field landmarks.")
-print("Press ENTER when finished.")
-print("Press U to undo.")
-print("Press R to reset.")
-print("Press ESC to cancel.")
-
-
-calibration_result = calibrator.calibrate(first_frame)
-
-if calibration_result is None:
-    cap.release()
-    cv2.destroyAllWindows()
-    raise RuntimeError("Field calibration cancelled.")
-
-
-H_field, image_points, field_points = calibration_result
-
-field_mapper.H_image_to_field = H_field
-
-print("\nField calibration successful.")
-
-# Restart video from the beginning.
-cap.set(cv2.CAP_PROP_POS_FRAMES, first_frame_number)
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def transform_point(point, H):
-    """
-    Transform a point from the previous frame
-    into the current frame.
-
-    H maps previous-frame coordinates
-    to current-frame coordinates.
-    """
-
-    point_array = np.array(
-        [[[point[0], point[1]]]],
-        dtype=np.float32
+def report_profile():
+    if profile_frames == 0:
+        return
+    averages_ms = {
+        name: profile_totals[name] * 1000 / profile_frames
+        for name in profile_stage_names
+    }
+    average_frame_ms = averages_ms["total"]
+    approximate_fps = 1000 / average_frame_ms if average_frame_ms > 0 else 0
+    details = " | ".join(
+        f"{name}={averages_ms[name]:.1f}ms"
+        for name in profile_stage_names
+        if name != "total"
     )
-
-    transformed = cv2.perspectiveTransform(
-        point_array,
-        H
+    print(
+        f"[PROFILE] avg over {profile_frames} frames: {details} | "
+        f"total={average_frame_ms:.1f}ms ({approximate_fps:.1f} FPS)"
     )
-
-    return transformed[0, 0]
-
-
-def get_raw_prediction(tracker):
-    """
-    Predict ball position without camera compensation.
-
-    The returned position is in previous-frame coordinates.
-    """
-
-    if not tracker.initialized:
-        return None
-
-    F = tracker.kf.transitionMatrix
-
-    state = tracker.kf.statePost.copy()
-
-    prediction = F @ state
-
-    return prediction[:2].flatten()
-
-
-def get_compensated_prediction(tracker, H):
-    """
-    Predict ball position after compensating for camera motion.
-
-    Does not modify the actual Kalman filter state.
-    The returned position is in current-frame coordinates.
-    """
-
-    if not tracker.initialized:
-        return None
-
-    state = tracker.kf.statePost.copy()
-
-    x, y, vx, vy = state.flatten()
-
-    # Without a valid homography, use the ordinary prediction.
-    if H is None:
-        prediction = tracker.kf.transitionMatrix @ state
-        return prediction[:2].flatten()
-
-    H = H.astype(np.float64)
-
-    # Apply homography to position.
-    denominator = (
-        H[2, 0] * x +
-        H[2, 1] * y +
-        H[2, 2]
-    )
-
-    if abs(denominator) < 1e-8:
-        return None
-
-    numerator_x = (
-        H[0, 0] * x +
-        H[0, 1] * y +
-        H[0, 2]
-    )
-
-    numerator_y = (
-        H[1, 0] * x +
-        H[1, 1] * y +
-        H[1, 2]
-    )
-
-    new_x = numerator_x / denominator
-    new_y = numerator_y / denominator
-
-    # Calculate local Jacobian to transform velocity.
-    J = np.array([
-        [
-            (H[0, 0] * denominator -
-             numerator_x * H[2, 0]) / denominator**2,
-
-            (H[0, 1] * denominator -
-             numerator_x * H[2, 1]) / denominator**2
-        ],
-        [
-            (H[1, 0] * denominator -
-             numerator_y * H[2, 0]) / denominator**2,
-
-            (H[1, 1] * denominator -
-             numerator_y * H[2, 1]) / denominator**2
-        ]
-    ])
-
-    velocity = J @ np.array([vx, vy])
-
-    compensated_state = np.array([
-        [new_x],
-        [new_y],
-        [velocity[0]],
-        [velocity[1]]
-    ], dtype=np.float32)
-
-    prediction = (
-        tracker.kf.transitionMatrix @ compensated_state
-    )
-
-    return prediction[:2].flatten()
-
-
-def map_players_to_field(player_positions, field_mapper):
-    """
-    Convert player image coordinates into normalized field coordinates.
-
-    Each player position is the bottom-center of their bounding box.
-
-    Returns:
-        List of normalized (x, y) field coordinates.
-    """
-
-    player_field_positions = []
-
-    for player_position in player_positions:
-
-        field_position = field_mapper.image_to_field(
-            player_position
-        )
-
-        if field_position is None:
-            continue
-
-        field_x, field_y = field_position
-
-        # Ignore positions outside the reference pitch.
-        if (
-            np.isfinite(field_x) and
-            np.isfinite(field_y) and
-            0 <= field_x <= 1 and
-            0 <= field_y <= 1
-        ):
-
-            player_field_positions.append(
-                (field_x, field_y)
-            )
-
-    return player_field_positions
-
-
-def draw_players_on_pitch(pitch, player_positions):
-    """
-    Draw player positions onto the top-down pitch.
-    """
-
-    for field_x, field_y in player_positions:
-
-        pixel_x = int(field_x * (PITCH_WIDTH - 1))
-        pixel_y = int(field_y * (PITCH_HEIGHT - 1))
-
-        cv2.circle(
-            pitch,
-            (pixel_x, pixel_y),
-            8,
-            (255, 100, 0),
-            -1
-        )
-
-        cv2.circle(
-            pitch,
-            (pixel_x, pixel_y),
-            8,
-            (255, 255, 255),
-            1
-        )
-
-    return pitch
-
-
-# ============================================================
-# MAIN VIDEO LOOP
-# ============================================================
 
 frame_number = 0
+last_landmark_observations = {}
+last_calibration = None
+last_goal_event = None
 
-while True:
+try:
+    while True:
+        frame_start = time.perf_counter()
+        stage_start = frame_start
+        ret, frame = cap.read()
+        if not ret:
+            break
+        record_profile_stage("read", stage_start)
+        frame_number += 1
+        profile_frames += 1
 
-    ret, frame = cap.read()
+        # Run the object detector every frame.
+        stage_start = time.perf_counter()
+        ball_detection, player_positions = detector.get_detections(
+            frame, player_class_id=PLAYER_CLASS_ID
+        )
+        record_profile_stage("detector", stage_start)
 
-    if not ret:
-        break
+        # Run the landmark model sparsely. On intervening frames, the
+        # CameraMotionEstimator tracks semantic points with optical flow.
+        run_landmark_model = (
+            field_mapper.H_image_to_field is None
+            or frame_number == 1
+            or frame_number % LANDMARK_UPDATE_INTERVAL == 0
+        )
+        calibration = None
+        stage_start = time.perf_counter()
+        if run_landmark_model:
+            calibration = landmark_detector.calibrate(frame)
+            last_landmark_observations = calibration["observations"]
+            last_calibration = calibration
+        record_profile_stage("landmarks", stage_start)
 
-    frame_number += 1
+        stage_start = time.perf_counter()
+        camera_result = camera.update(
+            frame,
+            landmarks=last_landmark_observations if run_landmark_model else None,
+        )
+        record_profile_stage("camera", stage_start)
+        camera_success = camera_result["success"]
+        H_camera = camera_result["homography"] if camera_success else None
 
+        stage_start = time.perf_counter()
+        # The old image->pitch homography is propagated into this frame
+        # using the inverse of the previous->current camera transform.
+        if camera_success and field_mapper.H_image_to_field is not None:
+            field_mapper.update_camera_motion(H_camera)
 
-    # ========================================================
-    # 1. YOLO DETECTION
-    # ========================================================
+        # A fresh landmark calibration is absolute, so it corrects any
+        # accumulated camera-motion drift. Do not overwrite with failed H.
+        if calibration is not None and calibration["success"]:
+            field_mapper.H_image_to_field = calibration["homography"].copy()
 
-    # Run YOLO once to detect both the ball and players.
-    detection, player_positions = detector.get_detections(
-        frame,
-        player_class_id=PLAYER_CLASS_ID
-    )
+        raw_prediction = get_raw_prediction(ball_tracker)
+        compensated_prediction = get_compensated_prediction(
+            ball_tracker, H_camera
+        )
+        if raw_prediction is not None and H_camera is not None:
+            raw_prediction = transform_point(raw_prediction, H_camera)
 
-
-    # ========================================================
-    # 2. CAMERA MOTION ESTIMATION
-    # ========================================================
-
-    # Estimate previous-frame -> current-frame homography.
-    camera_result = camera.update(frame)
-
-    camera_success = camera_result["success"]
-
-    H_camera = (
-        camera_result["homography"]
-        if camera_success
-        else None
-    )
-
-
-    # ========================================================
-    # 3. BALL PREDICTIONS
-    # ========================================================
-
-    raw_prediction = get_raw_prediction(tracker)
-
-    compensated_prediction = get_compensated_prediction(
-        tracker,
-        H_camera
-    )
-
-    # Transform raw prediction into current-frame coordinates.
-    if raw_prediction is not None and H_camera is not None:
-
-        raw_prediction = transform_point(
-            raw_prediction,
-            H_camera
+        ball_position = ball_tracker.update(
+            ball_detection, camera_H=H_camera
+        )
+        player_tracks = player_tracker.update(
+            player_positions, camera_H=H_camera
         )
 
+        # Map player ground-contact points (bbox bottom-center) to the pitch.
+        player_field_positions = []
+        for track in player_tracks:
+            mapped = map_track_to_field(track["position"], field_mapper)
+            if mapped is not None:
+                player_field_positions.append({
+                    "id": track["id"],
+                    "position": mapped,
+                    "detected": track["detected"],
+                    "missed": track["missed"],
+                })
 
-    # ========================================================
-    # 4. UPDATE BALL TRACKER
-    # ========================================================
-
-    ball_position = tracker.update(
-        detection,
-        camera_H=H_camera
-    )
-
-
-    # ========================================================
-    # 5. UPDATE FIELD HOMOGRAPHY
-    # ========================================================
-
-    if camera_success:
-
-        field_mapper.update_camera_motion(
-            H_camera
+        # A ball center is not on the ground plane while airborne. This
+        # simple visualization still maps the detector/tracker center;
+        # interpret its pitch position cautiously during aerial flight.
+        ball_field_position = (
+            map_track_to_field(ball_position, field_mapper)
+            if ball_position is not None else None
         )
 
-
-    # ========================================================
-    # 6. UPDATE PLAYER TRACKER
-    # ========================================================
-
-    # >>> NEW
-    # Each player has an independent Kalman filter.
-    #
-    # Existing tracks are:
-    # 1. Compensated for camera movement.
-    # 2. Predicted into the current frame.
-    # 3. Matched against current YOLO detections.
-    # 4. Corrected when a matching detection is found.
-    #
-    # Players without detections retain their predicted positions.
-
-    player_tracks = player_tracker.update(
-        player_positions,
-        camera_H=H_camera
-    )
-
-
-    # ========================================================
-    # 7. MAP PLAYER POSITIONS TO FIELD COORDINATES
-    # ========================================================
-
-    # >>> UPDATED
-    # Map Kalman-filtered positions instead of raw YOLO positions.
-
-    player_field_positions = []
-
-    for track in player_tracks:
-
-        x, y = track["position"]
-
-        field_position = field_mapper.image_to_field(
-            (x, y)
+        # Goal detection uses only a CURRENT YOLO ball observation for its
+        # trajectory history; Kalman-only predictions are never treated as
+        # observed ball positions. This avoids confirming goals from drift.
+        observed_ball_field_position = (
+            map_track_to_field(ball_detection, field_mapper)
+            if ball_detection is not None else None
         )
-
-        if field_position is None:
-            continue
-
-        field_x, field_y = field_position
-
-        if (
-            np.isfinite(field_x) and
-            np.isfinite(field_y) and
-            0 <= field_x <= 1 and
-            0 <= field_y <= 1
-        ):
-
-            player_field_positions.append({
-                "id": track["id"],
-                "position": (field_x, field_y),
-                "detected": track["detected"],
-                "missed": track["missed"]
-            })
-
-
-    # ========================================================
-    # 8. MAP BALL POSITION TO FIELD COORDINATES
-    # ========================================================
-
-    field_position = None
-
-    if ball_position is not None:
-
-        field_position = field_mapper.image_to_field(
-            ball_position
+        goal_result = goal_detector.update(
+            frame_number=frame_number,
+            observed_ball_field_position=observed_ball_field_position,
+            ball_missed_frames=ball_tracker.missed_frames,
         )
-
-        if field_position is not None:
-
-            field_x, field_y = field_position
-
-            if not (
-                np.isfinite(field_x) and
-                np.isfinite(field_y) and
-                0 <= field_x <= 1 and
-                0 <= field_y <= 1
-            ):
-
-                field_position = None
-
-
-    # ========================================================
-    # 9. CAMERA MOTION VISUALIZATION
-    # ========================================================
-
-    camera_view = frame.copy()
-
-    if SHOW_CAMERA_MOTION:
-
-        camera_view = camera_visualizer.visualize(
-            frame=frame,
-            camera_result=camera_result,
-            detection=detection,
-            raw_prediction=raw_prediction,
-            compensated_prediction=compensated_prediction
+        if goal_result["goal"]:
+            last_goal_event = {
+                "side": goal_result["goal_side"],
+                "frame": goal_result["event_frame"],
+                "until": frame_number + int(3.0 * video_fps),
+                "confidence": goal_result["confidence"],
+            }
+        goal_display_active = (
+            last_goal_event is not None
+            and frame_number <= last_goal_event["until"]
         )
-
-
-    # ========================================================
-    # 10. DRAW PLAYER DETECTIONS ON VIDEO
-    # ========================================================
-
-    # >>> UPDATED
-    # Draw player bounding-box bottom-center points.
-
-    for player_x, player_y in player_positions:
-
-        cv2.circle(
-            camera_view,
-            (int(player_x), int(player_y)),
-            4,
-            (255, 100, 0),
-            -1
+        goal_label = (
+            f"GOAL CONFIRMED - {last_goal_event['side'].upper()}"
+            if goal_display_active else f"Goal detector: {goal_result['state']}"
         )
+        record_profile_stage("tracking_mapping", stage_start)
 
+        stage_start = time.perf_counter()
+        camera_view = frame.copy()
+        if SHOW_LANDMARKS and last_landmark_observations:
+            camera_view = draw_landmarks(camera_view, last_landmark_observations)
 
-    # >>> NEW
-    # Draw persistent player IDs on the video.
+        if SHOW_CAMERA_MOTION:
+            camera_view = camera_visualizer.visualize(
+                frame=camera_view,
+                camera_result=camera_result,
+                detection=ball_detection,
+                raw_prediction=raw_prediction,
+                compensated_prediction=compensated_prediction,
+            )
 
-    for track in player_tracks:
+        for x, y in player_positions:
+            cv2.circle(camera_view, (int(x), int(y)), 4, (255, 100, 0), -1)
 
-        x, y = track["position"]
+        for track in player_tracks:
+            x, y = track["position"]
+            color = (0, 255, 0) if track["detected"] else (0, 255, 255)
+            cv2.putText(
+                camera_view, f"Player {track['id']}",
+                (int(x) + 8, int(y) - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1,
+            )
 
-        color = (
-            (0, 255, 0)
-            if track["detected"]
-            else (0, 255, 255)
-        )
+        if ball_position is not None:
+            x, y = np.round(ball_position).astype(int)
+            cv2.circle(camera_view, (x, y), 6, (0, 255, 0), -1)
+            cv2.putText(
+                camera_view, "Tracked ball", (x + 10, y + 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
+            )
 
+        # Goal-event diagnostics on the camera view.
+        status_color = (0, 255, 0) if goal_display_active else (0, 200, 255)
         cv2.putText(
             camera_view,
-            f"Player {track['id']}",
-            (int(x) + 8, int(y) - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            color,
-            1
+            f"{goal_label} | {goal_result['reason']}",
+            (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.62, status_color, 2,
         )
-
-
-    # ========================================================
-    # 11. DRAW TRACKED BALL ON VIDEO
-    # ========================================================
-
-    if ball_position is not None:
-
-        x, y = map(
-            int,
-            np.round(ball_position)
-        )
-
-        cv2.circle(
-            camera_view,
-            (x, y),
-            6,
-            (0, 255, 0),
-            -1
-        )
-
-        cv2.putText(
-            camera_view,
-            "Tracked ball",
-            (x + 10, y + 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            2
-        )
-
-
-    # ========================================================
-    # 12. CREATE TOP-DOWN PITCH
-    # ========================================================
-
-    if SHOW_PITCH:
-
-        pitch_view = pitch_visualizer.show(
-            field_position
-        )
-
-        # >>> UPDATED
-        # Draw all Kalman-filtered player positions.
-        # Orange = currently detected.
-        # Yellow = predicted because detection was missed.
-
-        for player in player_field_positions:
-
-            player_id = player["id"]
-
-            field_x, field_y = player["position"]
-
-            detected = player["detected"]
-
-            pixel_x = int(
-                field_x * (PITCH_WIDTH - 1)
+        if goal_result["goal"]:
+            print(
+                f"GOAL CONFIRMED | frame={goal_result['event_frame']} | "
+                f"side={goal_result['goal_side']} | "
+                f"confidence={goal_result['confidence']:.2f}"
             )
 
-            pixel_y = int(
-                field_y * (PITCH_HEIGHT - 1)
-            )
-
-            if detected:
-                color = (255, 140, 0)
-            else:
-                color = (0, 255, 255)
-
-            cv2.circle(
-                pitch_view,
-                (pixel_x, pixel_y),
-                8,
-                color,
-                -1
-            )
-
+        if SHOW_PITCH:
+            pitch_view = pitch_visualizer.show(ball_field_position)
+            for player in player_field_positions:
+                fx, fy = player["position"]
+                px = int(fx * (PITCH_WIDTH - 1))
+                py = int(fy * (PITCH_HEIGHT - 1))
+                color = (255, 140, 0) if player["detected"] else (0, 255, 255)
+                cv2.circle(pitch_view, (px, py), 8, color, -1)
+                cv2.putText(
+                    pitch_view, str(player["id"]), (px + 10, py - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                )
             cv2.putText(
                 pitch_view,
-                str(player_id),
-                (pixel_x + 10, pixel_y - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 255, 255),
-                1
+                f"{goal_label}",
+                (15, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                status_color, 2,
+            )
+            cv2.putText(
+                pitch_view,
+                f"Players: {len(player_tracks)}",
+                (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (255, 255, 255), 2,
+            )
+            cv2.imshow("Top Down Soccer Field", pitch_view)
+
+        cv2.imshow("Camera Motion + Ball + Player Tracking", camera_view)
+        record_profile_stage("render", stage_start)
+
+        stage_start = time.perf_counter()
+        if calibration is not None:
+            print(
+                f"Frame {frame_number}: landmark calibration "
+                f"{'OK' if calibration['success'] else 'REJECTED'} | "
+                f"points={len(calibration['observations'])} | "
+                f"inliers={calibration['inliers']} | "
+                f"mean_error={calibration['mean_error']} | "
+                f"coverage={calibration['coverage']:.3f}"
+                f"time={time.perf_counter() - frame_start:.3f}s"
             )
 
+        if camera_success:
+            motion = camera_result["motion"]
+            print(
+                f"Frame {frame_number} | camera={camera_result['source']} | "
+                f"inliers={camera_result['inliers']} | "
+                f"players={len(player_tracks)} | "
+                f"pan=({motion['translation_x']:.1f},"
+                f"{motion['translation_y']:.1f}) | "
+                f"zoom={motion['zoom_percent']:+.2f}% | "
+                f"rotation={motion['rotation_degrees']:.2f}"
+                f"time={time.perf_counter() - frame_start:.3f}s"
+            )
+        else:
+            print(
+                f"Frame {frame_number} | camera estimation failed "
+                f"({camera_result['source']}) | players={len(player_tracks)}"
+            )
+        record_profile_stage("console", stage_start)
 
-        # Player count
-        cv2.putText(
-            pitch_view,
-            f"Players: {len(player_tracks)}",
-            (15, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2
-        )
+        stage_start = time.perf_counter()
+        key = cv2.waitKey(1) & 0xFF
+        record_profile_stage("waitKey", stage_start)
+        record_profile_stage("total", frame_start)
 
-        # >>> NEW
-        # Tracking legend
+        if frame_number % PROFILE_EVERY_N_FRAMES == 0:
+            report_profile()
+            for name in profile_stage_names:
+                profile_totals[name] = 0.0
+            profile_frames = 0
 
-        cv2.circle(
-            pitch_view,
-            (20, 55),
-            5,
-            (255, 140, 0),
-            -1
-        )
+        if key == ord("q"):
+            break
+        if key == ord("r"):
+            print("Resetting object trackers and camera motion.")
+            ball_tracker.reset()
+            goal_detector.reset()
+            last_goal_event = None
+            player_tracker = PlayerTracker(
+                max_distance=PLAYER_MAX_DISTANCE,
+                max_missed=PLAYER_MAX_MISSED,
+            )
+            camera.reset()
+            last_landmark_observations = {}
+            field_mapper.H_image_to_field = None
 
-        cv2.putText(
-            pitch_view,
-            "Detected",
-            (35, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1
-        )
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
 
-        cv2.circle(
-            pitch_view,
-            (115, 55),
-            5,
-            (0, 255, 255),
-            -1
-        )
-
-        cv2.putText(
-            pitch_view,
-            "Predicted",
-            (130, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1
-        )
-
-        cv2.imshow(
-            "Top Down Soccer Field",
-            pitch_view
-        )
-
-
-    # ========================================================
-    # 13. DISPLAY VIDEO
-    # ========================================================
-
-    cv2.imshow(
-        "Camera Motion + Ball + Player Tracking",
-        camera_view
-    )
-
-
-    # ========================================================
-    # 14. DEBUG INFORMATION
-    # ========================================================
-
-    if camera_success:
-
-        motion = camera_result["motion"]
-
-        print(
-            f"Frame {frame_number} | "
-            f"Players: {len(player_tracks)} | "
-            f"Pan X: {motion['translation_x']:.1f} | "
-            f"Pan Y: {motion['translation_y']:.1f} | "
-            f"Zoom: {motion['zoom_percent']:+.2f}% | "
-            f"Rotation: {motion['rotation_degrees']:.2f} | "
-            f"Inliers: {camera_result['inliers']}"
-        )
-
-    else:
-
-        print(
-            f"Frame {frame_number} | "
-            f"Camera estimation failed | "
-            f"Players: {len(player_tracks)}"
-        )
-
-    if field_position is not None:
-
-        print(
-            f"Ball field position: "
-            f"X={field_position[0]:.3f}, "
-            f"Y={field_position[1]:.3f}"
-        )
-
-
-    # ========================================================
-    # 15. USER INPUT
-    # ========================================================
-
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == ord("q"):
-        break
-
-    elif key == ord("r"):
-
-        print("Resetting ball and player trackers.")
-
-        tracker.reset()
-
-        # >>> NEW
-        player_tracker = PlayerTracker(
-            max_distance=PLAYER_MAX_DISTANCE,
-            max_missed=PLAYER_MAX_MISSED
-        )
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-cap.release()
-cv2.destroyAllWindows()
-
-print("\nVideo processing complete.")
+report_profile()
+print("Video processing complete.")
